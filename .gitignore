@@ -1,0 +1,8 @@
+__pycache__/
+__pychache__/
+.venv/
+*.egg-info/
+build/
+dist/
+wsl-venv/
+.hermes/
