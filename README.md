@@ -73,6 +73,25 @@ args = []
 
 Hermes Agent has a native MCP client. Register Bifrost MCP as a stdio MCP server with the `hermes mcp add` command. Use the console script as the command and leave `--args` empty.
 
+For most users, prefer the setup helper. It creates the virtualenv, installs Bifrost, verifies `gopass`, registers the MCP server, and writes runtime path settings to Hermes MCP config rather than `.env`:
+
+```bash
+scripts/setup-hermes-mcp.sh --profile lseng --home /home/hermes
+```
+
+Why explicit `--home` matters: Hermes profiles, containers, systemd units, and web UIs may run MCP subprocesses with a profile-scoped or service-specific `HOME`. Bifrost credentials are stored under the operating-system account home that owns the `gopass` and GPG store. The setup helper therefore registers Bifrost with explicit environment values such as:
+
+```yaml
+mcp_servers:
+  bifrost:
+    command: /home/hermes/mcp_servers/bifrost-mcp/.venv/bin/bifrost-mcp
+    env:
+      HOME: /home/hermes
+      GNUPGHOME: /home/hermes/.gnupg
+```
+
+Do not put SSH passwords, GPG passphrases, or private keys in Hermes `.env` or `config.yaml`. `.env` is for application secrets such as API tokens; Bifrost SSH/sudo secrets belong in `gopass`, GPG agent, SSH agent, or another real secret manager.
+
 WSL/Linux, using the WSL virtualenv:
 
 ```bash
@@ -147,6 +166,54 @@ bifrost-mcp --session-idle-timeout-seconds 1800
 
 Bifrost MCP requires `gopass` for SSH and sudo secrets. Secrets are managed out-of-band by the local user and are never accepted as normal MCP tool parameters.
 
+### GPG unlock model
+
+Bifrost intentionally does not accept raw passwords or private keys from agent-facing MCP tools. The MCP server resolves secrets server-side through `gopass`, which in turn relies on GPG. For interactive desktops and developer machines, the recommended security model is:
+
+1. Store SSH/sudo credentials in `gopass`.
+2. Warm `gpg-agent` from a real terminal when needed:
+
+   ```bash
+   export GPG_TTY=$(tty)
+   bifrost-mcp unlock
+   ```
+
+3. Let `gpg-agent` cache the unlock for a bounded time. You usually unlock once per cache window, not before every MCP tool call. After the TTL expires or after reboot, run `bifrost-mcp unlock` again.
+
+The unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. Credentials encrypted to the same GPG key should then work until the cache expires. Use filters only if you need to target a specific credential:
+
+```bash
+bifrost-mcp unlock --host example-host --user admin
+bifrost-mcp unlock --purpose ssh
+bifrost-mcp unlock ssh://admin@example-host
+```
+
+A reasonable `~/.gnupg/gpg-agent.conf` is:
+
+```conf
+default-cache-ttl 1800
+max-cache-ttl 7200
+pinentry-program /usr/bin/pinentry-curses
+```
+
+Reload it with:
+
+```bash
+gpgconf --kill gpg-agent
+gpgconf --launch gpg-agent
+```
+
+This keeps secrets encrypted at rest, requires an explicit human unlock, and limits the window in which a non-interactive MCP process can decrypt records. For unattended servers, prefer a dedicated service account and a real secret-manager integration or a tightly scoped GPG/pass store. Avoid putting GPG passphrases or SSH passwords in `.env`, shell history, or Hermes config.
+
+Run diagnostics any time setup behaves unexpectedly:
+
+```bash
+bifrost-mcp doctor
+bifrost-mcp doctor --unlock
+```
+
+The doctor command reports environment paths, missing dependencies, gopass initialization, GPG key visibility, and decrypt/unlock failures without printing secret values. With `--unlock`, it also attempts the same safe one-record warm-up used by `bifrost-mcp unlock`.
+
 Credential slugs are deterministic and safe to display:
 
 ```text
@@ -187,6 +254,15 @@ bifrost-mcp credential add ssh://admin@example-host --key ~/.ssh/id_ed25519
 # Metadata only; never prints secrets
 bifrost-mcp credential list --host example-host
 bifrost-mcp credential show ssh://admin@example-host
+
+# Warm gpg-agent without printing the secret; use once per cache window
+bifrost-mcp unlock
+bifrost-mcp unlock --host example-host --user admin
+bifrost-mcp unlock ssh://admin@example-host
+
+# Legacy scoped form still works
+bifrost-mcp credential unlock ssh://admin@example-host
+bifrost-mcp credential unlock --host example-host --user admin
 
 # Remove one record type from an exact slug
 bifrost-mcp credential remove ssh://admin@example-host --key

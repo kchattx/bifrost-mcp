@@ -64,6 +64,10 @@ class FakeStore:
     def show_metadata(self, slug):
         return CredentialMetadata(slug=slug, purpose=slug.split(":", 1)[0], username="user", canonical_host="example.com", has_password=True)
 
+    def unlock_record(self, slug, record_type=None):
+        self.unlocked = (slug, record_type)
+        return {"status": "unlocked", "slug": slug, "record_type": record_type or "password"}
+
     def remove_record(self, slug, record_type):
         self.removed.append((slug, record_type))
         return CredentialMetadata(slug=slug, purpose=slug.split(":", 1)[0], username="user", canonical_host="example.com")
@@ -208,6 +212,80 @@ def test_credential_cli_add_key_reads_file(tmp_path):
 
     assert rc == 0
     assert store.stored == [("ssh://user@example.com", "key", "PRIVATE KEY")]
+
+
+
+
+def test_credential_cli_unlock_accepts_exact_slug(capsys):
+    args = mcp_server._build_parser().parse_args(["credential", "unlock", "ssh://user@example.com"])
+    store = FakeStore()
+
+    rc = mcp_server._handle_credential_cli(args, store=store)
+
+    assert rc == 0
+    assert store.unlocked == ("ssh://user@example.com", "password")
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unlocked"
+    assert "secret" not in json.dumps(payload).lower()
+
+
+def test_credential_cli_unlock_resolves_single_host_user_match(capsys):
+    rows = [CredentialMetadata("ssh://deploy@example.com", "ssh", "deploy", "example.com", has_password=True)]
+    args = mcp_server._build_parser().parse_args(["credential", "unlock", "--host", "Example.COM", "--user", "deploy"])
+    store = FakeStore(rows=rows)
+
+    rc = mcp_server._handle_credential_cli(args, store=store)
+
+    assert rc == 0
+    assert store.unlocked == ("ssh://deploy@example.com", "password")
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["slug"] == "ssh://deploy@example.com"
+
+def test_top_level_unlock_selects_first_ssh_credential(capsys):
+    rows = [
+        CredentialMetadata("sudo://root@example.com", "sudo", "root", "example.com", has_password=True),
+        CredentialMetadata("ssh://admin@example.com", "ssh", "admin", "example.com", has_password=True),
+    ]
+    args = mcp_server._build_parser().parse_args(["unlock"])
+    store = FakeStore(rows=rows)
+
+    rc = mcp_server._handle_unlock_cli(args, store=store)
+
+    assert rc == 0
+    assert store.unlocked == ("ssh://admin@example.com", "password")
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "unlocked"
+    assert payload["slug"] == "ssh://admin@example.com"
+    assert "secret" not in json.dumps(payload).lower()
+    assert "same GPG key" in payload["message"]
+
+
+def test_top_level_unlock_filters_by_host_and_user(capsys):
+    rows = [
+        CredentialMetadata("ssh://admin@example.com", "ssh", "admin", "example.com", has_password=True),
+        CredentialMetadata("ssh://deploy@example.com", "ssh", "deploy", "example.com", has_password=True),
+    ]
+    args = mcp_server._build_parser().parse_args(["unlock", "--host", "Example.COM", "--user", "deploy"])
+    store = FakeStore(rows=rows)
+
+    rc = mcp_server._handle_unlock_cli(args, store=store)
+
+    assert rc == 0
+    assert store.unlocked == ("ssh://deploy@example.com", "password")
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["slug"] == "ssh://deploy@example.com"
+
+
+def test_top_level_unlock_reports_missing_credentials(capsys):
+    args = mcp_server._build_parser().parse_args(["unlock"])
+    store = FakeStore(rows=[])
+
+    rc = mcp_server._handle_unlock_cli(args, store=store)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["status"] == "error"
+    assert payload["error"]["code"] == "missing_credential"
 
 
 def test_create_server_uses_bifrost_name_and_does_not_import_legacy_app_package():

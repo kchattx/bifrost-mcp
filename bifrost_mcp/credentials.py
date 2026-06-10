@@ -188,6 +188,22 @@ class CredentialStore:
             raise CredentialValidationError("sudo password resolution requires a sudo:// credential slug")
         return self.get_record(slug, "password").secret
 
+    def unlock_record(self, slug: str, record_type: CredentialRecordType | None = None) -> dict[str, str]:
+        """Decrypt one record to warm gpg-agent without returning secret material."""
+        parsed = parse_slug(slug)
+        if record_type is not None:
+            self.get_record(slug, record_type)
+            return {"status": "unlocked", "slug": slug, "record_type": record_type}
+        if parsed.purpose == "sudo":
+            self.get_record(slug, "password")
+            return {"status": "unlocked", "slug": slug, "record_type": "password"}
+        try:
+            self.get_record(slug, "key")
+            return {"status": "unlocked", "slug": slug, "record_type": "key"}
+        except CredentialNotFound:
+            self.get_record(slug, "password")
+            return {"status": "unlocked", "slug": slug, "record_type": "password"}
+
     def remove_record(self, slug: str, record_type: CredentialRecordType) -> CredentialMetadata:
         parsed = parse_slug(slug)
         self._validate_record_type(parsed, record_type)
