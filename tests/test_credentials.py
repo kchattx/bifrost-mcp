@@ -59,12 +59,18 @@ def test_invalid_slugs_are_rejected(slug):
 
 def test_store_record_uses_gopass_insert_and_refuses_overwrite(tmp_path):
     runner = FakeRunner()
-    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+    store = CredentialStore(
+        runner=runner,
+        index_path=tmp_path / "credentials.json",
+        password_store_dir=tmp_path / "password-store",
+    )
 
     metadata = store.store_record("ssh://user@example.com", "password", "secret")
 
     assert metadata.has_password is True
     assert any(call[0][0:3] == ["gopass", "insert", "-m"] for call in runner.calls)
+    record_path = store._record_path("ssh://user@example.com", "password")
+    assert (tmp_path / "password-store" / record_path).parent.is_dir()
     assert "secret" not in metadata.to_dict().values()
     with pytest.raises(CredentialRecordExists):
         store.store_record("ssh://user@example.com", "password", "new-secret")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -126,9 +127,16 @@ class CredentialStore:
     every secret record back from gopass.
     """
 
-    def __init__(self, *, runner: Runner | None = None, index_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        runner: Runner | None = None,
+        index_path: Path | None = None,
+        password_store_dir: Path | None = None,
+    ) -> None:
         self._runner = runner or subprocess.run
         self._index_path = index_path or (Path.home() / ".config" / "bifrost_mcp" / "credentials.json")
+        self._password_store_dir = password_store_dir
 
     def validate_backend(self) -> None:
         if shutil.which("gopass") is None:
@@ -138,7 +146,7 @@ class CredentialStore:
         result = self._run(["gopass", "ls"], input_text=None, check=False)
         if result.returncode != 0:
             raise CredentialBackendUnavailable(
-                "gopass is installed but not initialized or not accessible. Run 'gopass setup' or unlock your store."
+                "gopass is installed but not initialized or not accessible. Run 'gopass init <gpg-key-id-or-email>' or unlock your store."
             )
 
     def store_record(self, slug: str, record_type: CredentialRecordType, secret: str) -> CredentialMetadata:
@@ -149,7 +157,9 @@ class CredentialStore:
         if self.record_exists(slug, record_type):
             raise CredentialRecordExists(f"{record_type} record already exists for {slug}")
         payload = json.dumps({"type": record_type, "secret": secret})
-        self._run(["gopass", "insert", "-m", self._record_path(slug, record_type)], input_text=payload, check=True)
+        record_path = self._record_path(slug, record_type)
+        self._ensure_record_parent(record_path)
+        self._run(["gopass", "insert", "-m", record_path], input_text=payload, check=True)
         return self._update_index(slug, record_type, exists=True)
 
     def get_record(self, slug: str, record_type: CredentialRecordType) -> CredentialRecord:
@@ -260,6 +270,22 @@ class CredentialStore:
     def _record_path(self, slug: str, record_type: CredentialRecordType) -> str:
         encoded = base64.urlsafe_b64encode(slug.encode("utf-8")).decode("ascii").rstrip("=")
         return f"bifrost_mcp/{encoded}/{record_type}"
+
+    def _ensure_record_parent(self, record_path: str) -> None:
+        password_store_dir = self._resolved_password_store_dir()
+        if password_store_dir is None:
+            return
+        (password_store_dir / record_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _resolved_password_store_dir(self) -> Path | None:
+        if self._password_store_dir is not None:
+            return self._password_store_dir
+        if self._runner is not subprocess.run:
+            return None
+        configured = os.environ.get("PASSWORD_STORE_DIR")
+        if configured:
+            return Path(configured).expanduser()
+        return Path.home() / ".password-store"
 
     def _validate_record_type(self, parsed: CredentialSlug, record_type: str) -> None:
         if record_type not in ("password", "key"):

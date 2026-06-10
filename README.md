@@ -11,7 +11,7 @@ Bifrost MCP currently focuses on SSH-backed remote shells. Future versions are i
 - Python 3.11 or newer
 - `mcp[cli]`
 - `paramiko`
-- `gopass` CLI for credential storage
+- `gopass` CLI for credential storage, installed and initialized in the same operating-system environment that runs `bifrost-mcp`
 
 ## Local Installation
 
@@ -162,9 +162,69 @@ BIFROST_MCP_SESSION_IDLE_TIMEOUT_SECONDS=1800 bifrost-mcp
 bifrost-mcp --session-idle-timeout-seconds 1800
 ```
 
+## gopass Setup
+
+Bifrost MCP reads SSH and sudo secrets from `gopass`. Install and initialize `gopass` in the same operating-system environment that runs the `bifrost-mcp` server process:
+
+- If Codex or Hermes Agent launches Bifrost MCP from a WSL/Linux virtualenv, install and initialize `gopass` in WSL/Linux.
+- If Codex or Hermes Agent launches Bifrost MCP from a Windows virtualenv, install and initialize Windows `gopass` and make sure it is on that process's `PATH`.
+- Do not initialize only Windows `gopass` for a WSL/Linux MCP server, or only WSL/Linux `gopass` for a Windows MCP server.
+
+Install examples:
+
+```bash
+# Debian/Ubuntu/WSL
+sudo apt update
+sudo apt install gopass gnupg
+```
+
+```bash
+# macOS
+brew install gopass gnupg
+```
+
+```powershell
+# Windows, for a Windows-native Bifrost MCP server
+winget install gopass.gopass
+# or: choco install gopass
+```
+
+Initialize a password store with a GPG identity. If you do not already have a GPG key, create one first:
+
+```bash
+gpg --full-generate-key
+gpg --list-secret-keys --keyid-format=long
+gopass init <gpg-key-id-or-email>
+```
+
+If you already have a usable GPG key, you can skip key generation and run only `gopass init <gpg-key-id-or-email>`.
+
+Verify `gopass` is ready in the Bifrost MCP runtime environment:
+
+```bash
+command -v gopass
+gopass ls
+```
+
+`gopass ls` must succeed before `bifrost-mcp credential ...`, `create_ssh_session`, or the sudo cache tools can resolve stored secrets.
+
+Optional sanity test:
+
+```bash
+printf '%s' 'test-secret' | gopass insert -m bifrost_mcp/readme-test
+gopass show bifrost_mcp/readme-test
+gopass rm -f bifrost_mcp/readme-test
+```
+
+The sanity-test path is only a temporary `gopass` entry. It is not a Bifrost credential slug.
+
+If `gopass` works in an interactive shell but fails when Bifrost MCP is launched by Codex or Hermes Agent, start the MCP client from the shell where `command -v gopass` and `gopass ls` work, or update the service/desktop environment so the launched process inherits the right `PATH`, GPG agent, and password-store environment. On Windows, restart the terminal or agent after installing `gopass` so `PATH` changes are visible.
+
 ## Credential Store Setup
 
-Bifrost MCP requires `gopass` for SSH and sudo secrets. Secrets are managed out-of-band by the local user and are never accepted as normal MCP tool parameters.
+Bifrost MCP requires `gopass` for SSH and sudo secrets. Secrets are managed out-of-band by the local user and are never accepted as normal MCP tool parameters. After `gopass ls` succeeds in the Bifrost MCP runtime environment, add Bifrost credentials with deterministic slugs.
+
+Bifrost stores secret records in `gopass` under `bifrost_mcp/...`; the credential slug remains the stable user-facing identifier. Bifrost keeps only non-secret metadata in `~/.config/bifrost_mcp/credentials.json` so list/show commands do not need to read every secret.
 
 ### GPG unlock model
 
@@ -238,7 +298,7 @@ ssh://deploy@example-host:2222
 
 ## Credential CLI
 
-Credentials are managed locally through CLI commands:
+Credentials are managed locally through CLI commands. These commands assume `gopass ls` succeeds in the same environment that runs `bifrost-mcp`:
 
 ```bash
 # Password record: prompts securely when run from a terminal
@@ -270,6 +330,13 @@ bifrost-mcp credential remove ssh://admin@example-host --password
 ```
 
 `credential add` refuses to overwrite an existing record of the same type. Use `credential remove` first if rotation is intentional.
+
+### Troubleshooting gopass
+
+- If Bifrost reports that `gopass` is unavailable, install `gopass` in the same OS environment that runs `bifrost-mcp` and confirm `command -v gopass` works there.
+- If `gopass ls` fails, initialize the password store with `gopass init <gpg-key-id-or-email>`, unlock the store if needed, or fix the local GPG/password-store configuration.
+- If `gopass` works in a shell but not through Codex or Hermes Agent, start the client from the working shell or update the launch environment so `PATH`, GPG agent, and password-store state are available to the MCP server process.
+- If WSL/Linux and Windows are both present, initialize `gopass` in the environment whose virtualenv path was registered with Codex or Hermes Agent.
 
 ## Available MCP Tools
 
