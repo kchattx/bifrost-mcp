@@ -284,6 +284,7 @@ Examples:
 ```text
 ssh://admin@example-host
 sudo://admin@example-host
+winrm://admin@example-host
 ssh://deploy@example-host:2222
 ```
 
@@ -292,9 +293,12 @@ ssh://deploy@example-host:2222
 Credentials are managed locally through CLI commands. These commands assume `gopass ls` succeeds in the same environment that runs `bifrost-mcp`:
 
 ```bash
-# Password record: prompts securely when run from a terminal
+# Password record: prompts securely when run from a terminal. For ssh:// slugs,
+# Bifrost also asks for an optional matching sudo password and stores it as
+# sudo://<user>@<host> when provided.
 bifrost-mcp credential add ssh://admin@example-host --password
 bifrost-mcp credential add sudo://admin@example-host --password
+bifrost-mcp credential add winrm://admin@example-host --password
 
 # Or read from piped stdin for scripts
 printf '%s' 'ssh-password' | bifrost-mcp credential add ssh://admin@example-host --password

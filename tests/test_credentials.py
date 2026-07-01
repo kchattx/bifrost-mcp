@@ -51,6 +51,21 @@ def test_slug_round_trip_and_canonical_host():
     assert canonicalize_host("Example.COM") == "example.com"
 
 
+def test_winrm_slug_round_trip_and_password_storage(tmp_path):
+    canonical = canonicalize_host(" Example.COM ")
+    slug = build_slug("winrm", "alice", canonical)
+    parsed = parse_slug(slug)
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+
+    metadata = store.store_record(slug, "password", "winrm-secret")
+
+    assert slug == "winrm://alice@example.com"
+    assert parsed.purpose == "winrm"
+    assert metadata.purpose == "winrm"
+    assert metadata.has_password is True
+
+
 @pytest.mark.parametrize("slug", ["http://u@example.com", "ssh://@example.com", "ssh://u@", "not-a-slug"])
 def test_invalid_slugs_are_rejected(slug):
     with pytest.raises((CredentialValidationError, ValueError)):

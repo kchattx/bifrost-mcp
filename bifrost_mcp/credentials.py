@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 
-CredentialPurpose = Literal["ssh", "sudo"]
+CredentialPurpose = Literal["ssh", "sudo", "winrm"]
 CredentialRecordType = Literal["password", "key"]
 
 
@@ -85,8 +85,8 @@ def canonicalize_host(host: str, port: int = 22) -> str:
 
 
 def build_slug(purpose: CredentialPurpose, username: str, canonical_host: str) -> str:
-    if purpose not in ("ssh", "sudo"):
-        raise CredentialValidationError("credential purpose must be 'ssh' or 'sudo'")
+    if purpose not in ("ssh", "sudo", "winrm"):
+        raise CredentialValidationError("credential purpose must be 'ssh', 'sudo', or 'winrm'")
     user = username.strip() if isinstance(username, str) else ""
     host = canonical_host.strip().lower() if isinstance(canonical_host, str) else ""
     if not user:
@@ -100,8 +100,8 @@ def parse_slug(slug: str) -> CredentialSlug:
     if not isinstance(slug, str) or "://" not in slug:
         raise CredentialValidationError("credential slug must be '<purpose>://<username>@<canonical-host>'")
     purpose, rest = slug.split("://", 1)
-    if purpose not in ("ssh", "sudo"):
-        raise CredentialValidationError("credential purpose must be 'ssh' or 'sudo'")
+    if purpose not in ("ssh", "sudo", "winrm"):
+        raise CredentialValidationError("credential purpose must be 'ssh', 'sudo', or 'winrm'")
     if "@" not in rest:
         raise CredentialValidationError("credential slug must include username and host")
     username, host = rest.split("@", 1)
@@ -235,8 +235,8 @@ class CredentialStore:
         user: str | None = None,
         purpose: CredentialPurpose | None = None,
     ) -> list[CredentialMetadata]:
-        if purpose is not None and purpose not in ("ssh", "sudo"):
-            raise CredentialValidationError("credential purpose must be 'ssh' or 'sudo'")
+        if purpose is not None and purpose not in ("ssh", "sudo", "winrm"):
+            raise CredentialValidationError("credential purpose must be 'ssh', 'sudo', or 'winrm'")
         host_filter = host.strip().lower() if isinstance(host, str) and host.strip() else None
         user_filter = user.strip() if isinstance(user, str) and user.strip() else None
         rows = []

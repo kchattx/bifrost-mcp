@@ -14,12 +14,14 @@ from mcp.server.fastmcp import FastMCP
 from bifrost_mcp.credentials import (
     CredentialError,
     CredentialNotFound,
+    CredentialRecordExists,
     CredentialRecordType,
     CredentialPurpose,
     CredentialStore,
     CredentialValidationError,
     build_slug,
     canonicalize_host,
+    parse_slug,
 )
 from bifrost_mcp.session import RemoteSessionHandler
 from bifrost_mcp.session_registry import SessionRegistry
@@ -268,7 +270,7 @@ def _build_parser() -> argparse.ArgumentParser:
     list_cmd = credential_sub.add_parser("list", help="List non-secret credential metadata.")
     list_cmd.add_argument("--host")
     list_cmd.add_argument("--user")
-    list_cmd.add_argument("--purpose", choices=("ssh", "sudo"))
+    list_cmd.add_argument("--purpose", choices=("ssh", "sudo", "winrm"))
 
     show = credential_sub.add_parser("show", help="Show non-secret credential metadata for a slug.")
     show.add_argument("slug")
@@ -283,7 +285,7 @@ def _build_parser() -> argparse.ArgumentParser:
     unlock.add_argument("slug", nargs="?", help="Exact credential slug, e.g. ssh://user@example.com")
     unlock.add_argument("--host", help="Resolve a single credential by host instead of exact slug.")
     unlock.add_argument("--user", help="Resolve a single credential by username instead of exact slug.")
-    unlock.add_argument("--purpose", choices=("ssh", "sudo"), default="ssh")
+    unlock.add_argument("--purpose", choices=("ssh", "sudo", "winrm"), default="ssh")
     unlock_record_group = unlock.add_mutually_exclusive_group()
     unlock_record_group.add_argument("--password", action="store_true")
     unlock_record_group.add_argument("--key", action="store_true")
@@ -291,10 +293,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read_password_secret() -> str:
+def _read_password_secret(prompt: str = "Credential password: ") -> str:
     if getattr(sys.stdin, "isatty", lambda: False)():
-        return getpass.getpass("Credential password: ")
+        return getpass.getpass(prompt)
     return sys.stdin.read().rstrip("\n")
+
+
+def _read_optional_sudo_password_for_ssh_slug() -> str:
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        return ""
+    return getpass.getpass("Sudo Password (Leave blank for none): ")
 
 
 def _select_unlock_target(
@@ -341,12 +349,22 @@ def _handle_credential_cli(args: argparse.Namespace, *, store: CredentialStore |
     store = store or CredentialStore()
     try:
         if args.credential_command == "add":
+            parsed = parse_slug(args.slug)
             record_type = "key" if args.key else "password"
             if record_type == "key":
                 secret = Path(args.key).read_text(encoding="utf-8")
             else:
                 secret = _read_password_secret()
+            sudo_password = _read_optional_sudo_password_for_ssh_slug() if parsed.purpose == "ssh" else ""
+            if store.record_exists(args.slug, record_type):
+                raise CredentialRecordExists(f"{record_type} record already exists for {args.slug}")
+            if sudo_password:
+                sudo_slug = build_slug("sudo", parsed.username, parsed.canonical_host)
+                if store.record_exists(sudo_slug, "password"):
+                    raise CredentialRecordExists(f"password record already exists for {sudo_slug}")
             metadata = store.store_record(args.slug, record_type, secret)
+            if sudo_password:
+                store.store_record(build_slug("sudo", parsed.username, parsed.canonical_host), "password", sudo_password)
             print(json.dumps({"status": "stored", "credential": metadata.to_dict()}, sort_keys=True))
             return 0
         if args.credential_command == "list":

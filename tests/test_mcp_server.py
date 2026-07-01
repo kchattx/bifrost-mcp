@@ -74,6 +74,9 @@ class FakeStore:
         self.removed.append((slug, record_type))
         return CredentialMetadata(slug=slug, purpose=slug.split(":", 1)[0], username="user", canonical_host="example.com")
 
+    def record_exists(self, slug, record_type):
+        return any(existing_slug == slug and existing_type == record_type for existing_slug, existing_type, _ in self.stored)
+
 
 def teardown_function():
     mcp_server._sessions.clear()
@@ -218,11 +221,70 @@ def test_credential_cli_add_password_prompts_on_tty(monkeypatch, capsys):
     args = mcp_server._build_parser().parse_args(["credential", "add", "ssh://user@example.com", "--password"])
     store = FakeStore()
     monkeypatch.setattr(sys, "stdin", TTYStdin())
-    monkeypatch.setattr(mcp_server.getpass, "getpass", lambda prompt: "typed-secret")
+    monkeypatch.setattr(mcp_server.getpass, "getpass", lambda prompt: "typed-secret" if prompt == "Credential password: " else "")
 
     rc = mcp_server._handle_credential_cli(args, store=store)
 
     assert rc == 0
+    assert store.stored == [("ssh://user@example.com", "password", "typed-secret")]
+    assert "typed-secret" not in capsys.readouterr().out
+
+
+def test_credential_cli_add_ssh_password_on_tty_stores_matching_sudo_when_provided(monkeypatch, capsys):
+    class TTYStdin:
+        def isatty(self):
+            return True
+
+        def read(self):
+            raise AssertionError("TTY password input should use getpass instead of blocking on stdin.read()")
+
+    prompts = []
+    secrets = iter(["typed-secret", "typed-sudo-secret"])
+    args = mcp_server._build_parser().parse_args(["credential", "add", "ssh://user@example.com", "--password"])
+    store = FakeStore()
+    monkeypatch.setattr(sys, "stdin", TTYStdin())
+    monkeypatch.setattr(
+        mcp_server.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or next(secrets),
+    )
+
+    rc = mcp_server._handle_credential_cli(args, store=store)
+
+    assert rc == 0
+    assert prompts == ["Credential password: ", "Sudo Password (Leave blank for none): "]
+    assert store.stored == [
+        ("ssh://user@example.com", "password", "typed-secret"),
+        ("sudo://user@example.com", "password", "typed-sudo-secret"),
+    ]
+    out = capsys.readouterr().out
+    assert "typed-secret" not in out
+    assert "typed-sudo-secret" not in out
+
+
+def test_credential_cli_add_ssh_password_on_tty_skips_sudo_when_blank(monkeypatch, capsys):
+    class TTYStdin:
+        def isatty(self):
+            return True
+
+        def read(self):
+            raise AssertionError("TTY password input should use getpass instead of blocking on stdin.read()")
+
+    prompts = []
+    secrets = iter(["typed-secret", ""])
+    args = mcp_server._build_parser().parse_args(["credential", "add", "ssh://user@example.com", "--password"])
+    store = FakeStore()
+    monkeypatch.setattr(sys, "stdin", TTYStdin())
+    monkeypatch.setattr(
+        mcp_server.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or next(secrets),
+    )
+
+    rc = mcp_server._handle_credential_cli(args, store=store)
+
+    assert rc == 0
+    assert prompts == ["Credential password: ", "Sudo Password (Leave blank for none): "]
     assert store.stored == [("ssh://user@example.com", "password", "typed-secret")]
     assert "typed-secret" not in capsys.readouterr().out
 
@@ -265,6 +327,14 @@ def test_credential_cli_unlock_resolves_single_host_user_match(capsys):
     assert store.unlocked == ("ssh://deploy@example.com", "password")
     payload = json.loads(capsys.readouterr().out)
     assert payload["slug"] == "ssh://deploy@example.com"
+
+
+def test_credential_parser_accepts_winrm_purpose():
+    list_args = mcp_server._build_parser().parse_args(["credential", "list", "--purpose", "winrm"])
+    unlock_args = mcp_server._build_parser().parse_args(["credential", "unlock", "--purpose", "winrm"])
+
+    assert list_args.purpose == "winrm"
+    assert unlock_args.purpose == "winrm"
 
 
 def test_create_server_uses_bifrost_name_and_does_not_import_legacy_app_package():
