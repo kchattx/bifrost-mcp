@@ -2,22 +2,18 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import base64
 import getpass
 import json
 import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
 from bifrost_mcp.credentials import (
     CredentialError,
     CredentialNotFound,
-    CredentialRecordExists,
     CredentialRecordType,
     CredentialPurpose,
     CredentialStore,
@@ -25,11 +21,12 @@ from bifrost_mcp.credentials import (
     build_slug,
     canonicalize_host,
 )
+from bifrost_mcp.session import RemoteSessionHandler
 from bifrost_mcp.session_registry import SessionRegistry
 from bifrost_mcp.ssh_handler import SSHHandler
 
 _IDLE_TIMEOUT_SECONDS = float(os.getenv("BIFROST_MCP_SESSION_IDLE_TIMEOUT_SECONDS", "3600"))
-_sessions: dict[str, SSHHandler] = {}
+_sessions: dict[str, RemoteSessionHandler] = {}
 _registry = SessionRegistry(idle_timeout_seconds=_IDLE_TIMEOUT_SECONDS, sessions=_sessions)
 
 
@@ -47,6 +44,10 @@ def _error(code: str, message: str) -> dict[str, Any]:
 def _credential_error(exc: Exception) -> dict[str, Any]:
     code = getattr(exc, "code", "credential_error")
     return _error(str(code), str(exc))
+
+
+def _unsupported_operation(operation: str, transport: str) -> dict[str, Any]:
+    return _error("unsupported_operation", f"Operation {operation} is not supported for {transport} sessions.")
 
 
 def _validate_create_session_inputs(
@@ -96,20 +97,27 @@ def _create_ssh_session_impl(host: str, username: str, port: int = 22, *, store:
     except CredentialError as exc:
         return _credential_error(exc)
 
-    handler = SSHHandler()
     try:
-        session_id = handler.open_session(
-            host=host,
-            username=username,
-            port=port,
-            auth_mode="key" if auth.auth_type == "key" else "password",
-            password=auth.secret if auth.auth_type == "password" else None,
-            private_key=auth.secret if auth.auth_type == "key" else None,
-        )
+        handler = _open_ssh_handler(host, username, port, auth)
     except Exception as exc:
         return _error("ssh_connection_failed", str(exc))
     _registry.register(handler)
-    return {"status": "created", "session_id": session_id, "host": canonical_host, "username": username, "port": port}
+    return {"status": "created", "session_id": handler.session_id, "transport": handler.transport, "host": canonical_host, "username": username, "port": port}
+
+
+def _open_ssh_handler(host: str, username: str, port: int, auth) -> SSHHandler:
+    handler = SSHHandler()
+    session_id = handler.open_session(
+        host=host,
+        username=username,
+        port=port,
+        auth_mode="key" if auth.auth_type == "key" else "password",
+        password=auth.secret if auth.auth_type == "password" else None,
+        private_key=auth.secret if auth.auth_type == "key" else None,
+    )
+    if session_id != handler.session_id:
+        raise RuntimeError("SSH handler returned mismatched session_id")
+    return handler
 
 
 def _list_credentials_impl(host: str, *, store: CredentialStore | None = None) -> dict[str, Any]:
@@ -134,8 +142,12 @@ def _list_credentials_impl(host: str, *, store: CredentialStore | None = None) -
     return {"status": "ok", "host": canonical_host, "users": users, "guidance": guidance}
 
 
-def _get_session(session_id: str) -> SSHHandler:
+def _get_session(session_id: str) -> RemoteSessionHandler:
     return _registry.get(session_id)
+
+
+def _list_sessions_impl() -> dict[str, Any]:
+    return {"sessions": [info.to_dict() for info in _registry.list_info()]}
 
 
 def create_server() -> FastMCP:
@@ -217,9 +229,9 @@ def create_server() -> FastMCP:
     def download_file(session_id: str, remote_path: str, local_path: str, create_parents: bool = False) -> dict[str, Any]:
         return _get_session(session_id).download_file(remote_path, local_path, create_parents=create_parents)
 
-    @server.tool(description="List all active SSH sessions managed by this MCP server.")
+    @server.tool(description="List all active remote sessions managed by this MCP server.")
     def list_sessions() -> dict[str, Any]:
-        return {"sessions": [info.to_dict() for info in _registry.list_info()]}
+        return _list_sessions_impl()
 
     @server.tool(description="Close an active SSH session and remove it from server state.")
     def close_ssh_session(session_id: str) -> dict[str, str]:
@@ -276,195 +288,7 @@ def _build_parser() -> argparse.ArgumentParser:
     unlock_record_group.add_argument("--password", action="store_true")
     unlock_record_group.add_argument("--key", action="store_true")
 
-    unlock_top = subparsers.add_parser(
-        "unlock",
-        help="Warm gpg-agent by decrypting one Bifrost credential without printing the secret.",
-    )
-    unlock_top.add_argument("slug", nargs="?", help="Optional exact credential slug, e.g. ssh://user@example.com")
-    unlock_top.add_argument("--host", help="Optional host filter.")
-    unlock_top.add_argument("--user", help="Optional username filter.")
-    unlock_top.add_argument("--purpose", choices=("ssh", "sudo"), help="Optional credential purpose filter; defaults to any, preferring ssh.")
-    unlock_top_record = unlock_top.add_mutually_exclusive_group()
-    unlock_top_record.add_argument("--password", action="store_true")
-    unlock_top_record.add_argument("--key", action="store_true")
-
-    doctor = subparsers.add_parser("doctor", help="Diagnose Bifrost MCP, gopass, GPG, and Hermes environment setup.")
-    doctor.add_argument("--unlock", action="store_true", help="Attempt to warm gpg-agent by decrypting one credential without printing it.")
     return parser
-
-
-CommandExists = Callable[[str], bool]
-CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
-
-
-def _default_command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-def _default_run_command(args: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(list(args), capture_output=True, text=True, timeout=kwargs.pop("timeout", 10), **kwargs)
-
-
-def _redacted_error(stderr: str) -> str:
-    text = (stderr or "").strip()
-    if not text:
-        return ""
-    # Keep diagnostics actionable without ever returning secret-bearing output.
-    safe_lines = []
-    for line in text.splitlines()[:4]:
-        lower = line.lower()
-        if any(token in lower for token in ("secret", "password", "private key", "passphrase")):
-            safe_lines.append("[redacted]")
-        else:
-            safe_lines.append(line[:300])
-    return "\n".join(safe_lines)
-
-
-def _classify_gopass_show_error(stderr: str) -> str:
-    lower = (stderr or "").lower()
-    if "decryption failed" in lower or "public key decryption failed" in lower:
-        return "decrypt_failed"
-    if "not found" in lower or "does not exist" in lower:
-        return "missing_record"
-    if "not initialized" in lower:
-        return "store_not_initialized"
-    return "gopass_show_failed"
-
-
-def _record_path_for_slug(slug: str, record_type: str) -> str:
-    encoded = base64.urlsafe_b64encode(slug.encode("utf-8")).decode("ascii").rstrip("=")
-    return f"bifrost_mcp/{encoded}/{record_type}"
-
-
-def _infer_real_home(home: str) -> str:
-    marker = "/.hermes/profiles/"
-    if marker in home:
-        return home.split(marker, 1)[0]
-    return str(Path.home())
-
-
-def _build_doctor_report(
-    *,
-    env: Mapping[str, str] | None = None,
-    store: CredentialStore | None = None,
-    command_exists: CommandExists = _default_command_exists,
-    run_command: CommandRunner = _default_run_command,
-    real_home_hint: str | None = None,
-) -> dict[str, Any]:
-    env = env or os.environ
-    home = env.get("HOME", "")
-    gnupg_home = env.get("GNUPGHOME") or (str(Path(home) / ".gnupg") if home else "")
-    password_store_dir = env.get("PASSWORD_STORE_DIR")
-    store = store or CredentialStore()
-    checks: dict[str, Any] = {}
-    recommendations: dict[str, str] = {}
-
-    profile_scoped = "/.hermes/profiles/" in home
-    checks["home"] = {
-        "value": home,
-        "profile_scoped": profile_scoped,
-        "gnupghome": gnupg_home,
-        "password_store_dir": password_store_dir or "",
-    }
-    if profile_scoped:
-        recommended_home = real_home_hint or _infer_real_home(home)
-        recommendations["mcp_servers.bifrost.env.HOME"] = (
-            f"Set this to the OS account home that owns the gopass store, e.g. {recommended_home}"
-        )
-        recommendations["mcp_servers.bifrost.env.GNUPGHOME"] = (
-            f"Set this to the matching GPG home, e.g. {recommended_home}/.gnupg"
-        )
-
-    checks["commands"] = {name: command_exists(name) for name in ("gopass", "gpg", "pinentry", "pinentry-curses")}
-    checks["gopass"] = {"found": checks["commands"]["gopass"], "ok": False}
-    if checks["commands"]["gopass"]:
-        try:
-            result = run_command(["gopass", "ls"], timeout=10)
-            checks["gopass"].update({"ok": result.returncode == 0, "returncode": result.returncode})
-            if result.returncode != 0:
-                checks["gopass"]["error"] = _redacted_error(result.stderr)
-                recommendations["initialize_gopass"] = "Run `gopass setup` or unlock/fix the password store for the HOME used by Bifrost."
-        except Exception as exc:
-            checks["gopass"].update({"ok": False, "error": type(exc).__name__})
-            recommendations["initialize_gopass"] = "Ensure gopass works non-interactively enough for `gopass ls` under Bifrost's HOME."
-    else:
-        recommendations["install_gopass"] = "Install gopass and gnupg with your OS package manager before adding Bifrost credentials."
-
-    checks["gpg"] = {"found": checks["commands"]["gpg"], "secret_keys": "unknown"}
-    if checks["commands"]["gpg"]:
-        try:
-            result = run_command(["gpg", "--list-secret-keys", "--keyid-format=long"], timeout=10)
-            checks["gpg"].update({"ok": result.returncode == 0, "secret_keys": result.returncode == 0 and bool(result.stdout.strip())})
-            if result.returncode != 0 or not result.stdout.strip():
-                recommendations["create_gpg_key"] = "Create/import a GPG secret key and initialize gopass for that key."
-        except Exception as exc:
-            checks["gpg"].update({"ok": False, "error": type(exc).__name__})
-
-    try:
-        rows = store.list_metadata()
-    except Exception as exc:
-        rows = []
-        checks["credential_metadata"] = {"ok": False, "count": 0, "error": type(exc).__name__}
-    else:
-        checks["credential_metadata"] = {"ok": True, "count": len(rows), "credentials": [row.to_dict() for row in rows]}
-
-    decrypt_check: dict[str, Any] = {"tested": False}
-    for row in rows[:1]:
-        metadata = row.to_dict()
-        slug = str(metadata.get("slug", ""))
-        record_type = "key" if metadata.get("has_key") else "password" if metadata.get("has_password") else ""
-        if not slug or not record_type or not checks["commands"].get("gopass"):
-            continue
-        path = _record_path_for_slug(slug, record_type)
-        try:
-            result = run_command(["gopass", "show", path], timeout=10)
-        except Exception as exc:
-            decrypt_check = {"tested": True, "ok": False, "error_code": type(exc).__name__}
-        else:
-            decrypt_check = {"tested": True, "ok": result.returncode == 0, "returncode": result.returncode}
-            if result.returncode != 0:
-                decrypt_check["error_code"] = _classify_gopass_show_error(result.stderr)
-                decrypt_check["error"] = _redacted_error(result.stderr)
-                if decrypt_check["error_code"] == "decrypt_failed":
-                    recommendations["unlock_gpg_agent"] = (
-                        "Unlock GPG from an interactive terminal (`export GPG_TTY=$(tty); gopass show <record>`) "
-                        "and use bounded gpg-agent cache TTLs, or configure a dedicated unattended secret backend."
-                    )
-        break
-    checks["gopass_decrypt"] = decrypt_check
-
-    needs_attention = any(
-        [
-            checks["home"]["profile_scoped"],
-            not checks["gopass"].get("ok", False),
-            checks["gpg"].get("secret_keys") is False,
-            checks["gopass_decrypt"].get("tested") and not checks["gopass_decrypt"].get("ok", False),
-        ]
-    )
-    return {"status": "needs_attention" if needs_attention else "ok", "checks": checks, "recommendations": recommendations}
-
-
-def _handle_doctor_cli(
-    args: argparse.Namespace,
-    *,
-    env: Mapping[str, str] | None = None,
-    store: CredentialStore | None = None,
-    command_exists: CommandExists = _default_command_exists,
-    run_command: CommandRunner = _default_run_command,
-) -> int:
-    store = store or CredentialStore()
-    report = _build_doctor_report(env=env, store=store, command_exists=command_exists, run_command=run_command)
-    if getattr(args, "unlock", False):
-        unlock_report: dict[str, Any] = {"attempted": True, "ok": False}
-        try:
-            slug, record_type = _select_unlock_target(store)
-            result = store.unlock_record(slug, record_type)
-            unlock_report.update({"ok": True, "slug": result["slug"], "record_type": result["record_type"]})
-        except (CredentialError, CredentialValidationError, OSError) as exc:
-            unlock_report.update({"ok": False, "error": _credential_error(exc)["error"]})
-        report["unlock"] = unlock_report
-    print(json.dumps(report, indent=2, sort_keys=True))
-    return 0 if report["status"] == "ok" else 1
 
 
 def _read_password_secret() -> str:
@@ -511,27 +335,6 @@ def _select_unlock_target(
         raise CredentialNotFound(f"No password credential record exists for {selected.slug}")
     return selected.slug, selected_record_type
 
-
-
-def _handle_unlock_cli(args: argparse.Namespace, *, store: CredentialStore | None = None) -> int:
-    store = store or CredentialStore()
-    try:
-        requested_record_type = "key" if getattr(args, "key", False) else "password" if getattr(args, "password", False) else None
-        slug, record_type = _select_unlock_target(
-            store,
-            slug=getattr(args, "slug", None),
-            host=getattr(args, "host", None),
-            user=getattr(args, "user", None),
-            purpose=getattr(args, "purpose", None),
-            record_type=requested_record_type,
-        )
-        result = store.unlock_record(slug, record_type)
-        result["message"] = "gpg-agent warmed; credentials encrypted to the same GPG key should work until the cache expires"
-        print(json.dumps(result, sort_keys=True))
-        return 0
-    except (CredentialError, CredentialValidationError, OSError) as exc:
-        print(json.dumps(_credential_error(exc), sort_keys=True), file=sys.stderr)
-        return 1
 
 
 def _handle_credential_cli(args: argparse.Namespace, *, store: CredentialStore | None = None) -> int:
@@ -583,10 +386,6 @@ def main(argv: list[str] | None = None) -> int:
     _registry.idle_timeout_seconds = args.session_idle_timeout_seconds
     if args.command == "credential":
         return _handle_credential_cli(args)
-    if args.command == "unlock":
-        return _handle_unlock_cli(args)
-    if args.command == "doctor":
-        return _handle_doctor_cli(args)
 
     server = create_server()
     server.settings.host = args.host

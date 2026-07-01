@@ -14,7 +14,11 @@ class FakeChannel:
         self.resized = None
 
     def send(self, text):
-        self.sent.append(text)
+        self.sent.append(text.decode("utf-8") if isinstance(text, bytes) else text)
+        return len(text)
+
+    def sendall(self, text):
+        self.sent.append(text.decode("utf-8") if isinstance(text, bytes) else text)
 
     def close(self):
         self.closed = True
@@ -82,6 +86,12 @@ def append_output(handler, text):
         handler._buffer_chunks.append(text)
 
 
+def test_ssh_handler_reports_transport():
+    handler = SSHHandler()
+
+    assert handler.transport == "ssh"
+
+
 def test_metadata_defaults_and_touch_updates():
     handler, channel = active_handler()
     before = handler.last_activity_at
@@ -92,6 +102,31 @@ def test_metadata_defaults_and_touch_updates():
     assert handler.canonical_host == "example.com"
     assert channel.sent == ["echo hi\n"]
     assert handler.last_activity_at > before
+
+
+def test_send_input_uses_full_channel_write():
+    class PartialSendChannel(FakeChannel):
+        def __init__(self):
+            super().__init__()
+            self.sendall_called = False
+
+        def send(self, text):
+            decoded = text.decode("utf-8") if isinstance(text, bytes) else text
+            self.sent.append(decoded[:1])
+            return 1
+
+        def sendall(self, text):
+            self.sendall_called = True
+            self.sent.append(text.decode("utf-8") if isinstance(text, bytes) else text)
+
+    handler, _ = active_handler()
+    channel = PartialSendChannel()
+    handler._channel = channel
+
+    handler.send_input("echo fast\nprintf done\n")
+
+    assert channel.sendall_called is True
+    assert channel.sent == ["echo fast\nprintf done\n"]
 
 
 def test_wait_for_output_regex_literal_and_timeout():

@@ -45,6 +45,7 @@ class _PersistingAutoAddPolicy(paramiko.MissingHostKeyPolicy if paramiko is not 
 
 
 class SSHHandler:
+    transport = "ssh"
     _READ_CHUNK_SIZE = 4096
     _CLOSE_TIMEOUT_SECONDS = 5
     _HOST_KEY_POLICY = "accept-new"
@@ -178,7 +179,7 @@ class SSHHandler:
         if channel is None:
             raise RuntimeError("The SSH session stdin is not available.")
         try:
-            channel.send(text)
+            channel.sendall(text.encode("utf-8"))
         except Exception as exc:
             raise RuntimeError(f"Failed to send SSH session input: {exc}") from exc
 

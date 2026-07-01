@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Iterable
 
-from bifrost_mcp.ssh_handler import SSHHandler
+from bifrost_mcp.session import RemoteSessionHandler
 
 
 @dataclass(frozen=True)
 class SessionInfo:
     session_id: str
+    transport: str
     host: str | None
     canonical_host: str | None
     username: str | None
@@ -19,6 +19,7 @@ class SessionInfo:
     def to_dict(self) -> dict[str, object]:
         return {
             "session_id": self.session_id,
+            "transport": self.transport,
             "host": self.host,
             "canonical_host": self.canonical_host,
             "username": self.username,
@@ -28,29 +29,29 @@ class SessionInfo:
 
 
 class SessionRegistry:
-    def __init__(self, *, idle_timeout_seconds: float = 3600, sessions: dict[str, SSHHandler] | None = None) -> None:
+    def __init__(self, *, idle_timeout_seconds: float = 3600, sessions: dict[str, RemoteSessionHandler] | None = None) -> None:
         self.idle_timeout_seconds = idle_timeout_seconds
-        self._sessions: dict[str, SSHHandler] = sessions if sessions is not None else {}
+        self._sessions: dict[str, RemoteSessionHandler] = sessions if sessions is not None else {}
 
     @property
-    def sessions(self) -> dict[str, SSHHandler]:
+    def sessions(self) -> dict[str, RemoteSessionHandler]:
         return self._sessions
 
-    def register(self, handler: SSHHandler) -> str:
+    def register(self, handler: RemoteSessionHandler) -> str:
         if not handler.session_id:
-            raise ValueError("Cannot register SSH handler without an active session_id")
+            raise ValueError("Cannot register remote session handler without an active session_id")
         self._sessions[handler.session_id] = handler
         return handler.session_id
 
-    def get(self, session_id: str) -> SSHHandler:
+    def get(self, session_id: str) -> RemoteSessionHandler:
         self.cleanup_stale()
         handler = self._sessions.get(session_id)
         if handler is None or handler.session_id != session_id:
             self._sessions.pop(session_id, None)
-            raise ValueError(f"SSH session '{session_id}' was not found.")
+            raise ValueError(f"Remote session '{session_id}' was not found.")
         return handler
 
-    def remove(self, session_id: str) -> SSHHandler:
+    def remove(self, session_id: str) -> RemoteSessionHandler:
         handler = self.get(session_id)
         self._sessions.pop(session_id, None)
         return handler
@@ -68,6 +69,7 @@ class SessionRegistry:
             infos.append(
                 SessionInfo(
                     session_id=session_id,
+                    transport=str(getattr(handler, "transport", "unknown")),
                     host=getattr(handler, "host", None),
                     canonical_host=getattr(handler, "canonical_host", None),
                     username=getattr(handler, "username", None),

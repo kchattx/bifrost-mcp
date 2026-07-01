@@ -12,6 +12,8 @@ from bifrost_mcp.credentials import CredentialMetadata, CredentialNotFound, Stor
 
 
 class FakeHandler:
+    transport = "ssh"
+
     def __init__(self, session_id, close_raises=False):
         self.session_id = session_id
         self.host = "example.com"
@@ -82,6 +84,18 @@ def test_legacy_auth_inputs_are_rejected():
         mcp_server._validate_auth_inputs("password", "secret", None, None)
 
 
+def test_unsupported_operation_error_shape():
+    result = mcp_server._unsupported_operation("resize_session", "winrm")
+
+    assert result == {
+        "status": "error",
+        "error": {
+            "code": "unsupported_operation",
+            "message": "Operation resize_session is not supported for winrm sessions.",
+        },
+    }
+
+
 def test_create_session_inputs_require_username_and_reject_legacy_fields():
     with pytest.raises(ValueError, match="requires username"):
         mcp_server._validate_create_session_inputs("example.com", "", 22)
@@ -137,10 +151,21 @@ def test_list_credentials_groups_by_user_and_guidance():
     ]
 
 
+def test_list_sessions_includes_transport():
+    handler = FakeHandler("session-1")
+    mcp_server._sessions["session-1"] = handler
+
+    result = mcp_server._list_sessions_impl()
+
+    assert result["sessions"][0]["transport"] == "ssh"
+
+
 def test_create_ssh_session_derives_slug_and_does_not_expose_auth_type(monkeypatch):
     opened = {}
 
     class FakeSSHHandler:
+        transport = "ssh"
+
         def open_session(self, **kwargs):
             opened.update(kwargs)
             self.session_id = "sid"
@@ -159,8 +184,8 @@ def test_create_ssh_session_derives_slug_and_does_not_expose_auth_type(monkeypat
 
     assert store.resolved_slug == "ssh://user@example.com"
     assert opened["password"] == "ssh-secret"
-    assert result == {"status": "created", "session_id": "sid", "host": "example.com", "username": "user", "port": 22}
-    assert "password" not in result and "auth_type" not in result
+    assert result == {"status": "created", "session_id": "sid", "transport": "ssh", "host": "example.com", "username": "user", "port": 22}
+    assert "password" not in result and "private_key" not in result and "auth_type" not in result
 
 
 def test_create_ssh_session_missing_credential_returns_structured_error():
@@ -240,52 +265,6 @@ def test_credential_cli_unlock_resolves_single_host_user_match(capsys):
     assert store.unlocked == ("ssh://deploy@example.com", "password")
     payload = json.loads(capsys.readouterr().out)
     assert payload["slug"] == "ssh://deploy@example.com"
-
-def test_top_level_unlock_selects_first_ssh_credential(capsys):
-    rows = [
-        CredentialMetadata("sudo://root@example.com", "sudo", "root", "example.com", has_password=True),
-        CredentialMetadata("ssh://admin@example.com", "ssh", "admin", "example.com", has_password=True),
-    ]
-    args = mcp_server._build_parser().parse_args(["unlock"])
-    store = FakeStore(rows=rows)
-
-    rc = mcp_server._handle_unlock_cli(args, store=store)
-
-    assert rc == 0
-    assert store.unlocked == ("ssh://admin@example.com", "password")
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "unlocked"
-    assert payload["slug"] == "ssh://admin@example.com"
-    assert "secret" not in json.dumps(payload).lower()
-    assert "same GPG key" in payload["message"]
-
-
-def test_top_level_unlock_filters_by_host_and_user(capsys):
-    rows = [
-        CredentialMetadata("ssh://admin@example.com", "ssh", "admin", "example.com", has_password=True),
-        CredentialMetadata("ssh://deploy@example.com", "ssh", "deploy", "example.com", has_password=True),
-    ]
-    args = mcp_server._build_parser().parse_args(["unlock", "--host", "Example.COM", "--user", "deploy"])
-    store = FakeStore(rows=rows)
-
-    rc = mcp_server._handle_unlock_cli(args, store=store)
-
-    assert rc == 0
-    assert store.unlocked == ("ssh://deploy@example.com", "password")
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["slug"] == "ssh://deploy@example.com"
-
-
-def test_top_level_unlock_reports_missing_credentials(capsys):
-    args = mcp_server._build_parser().parse_args(["unlock"])
-    store = FakeStore(rows=[])
-
-    rc = mcp_server._handle_unlock_cli(args, store=store)
-
-    assert rc == 1
-    payload = json.loads(capsys.readouterr().err)
-    assert payload["status"] == "error"
-    assert payload["error"]["code"] == "missing_credential"
 
 
 def test_create_server_uses_bifrost_name_and_does_not_import_legacy_app_package():

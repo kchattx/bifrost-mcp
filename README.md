@@ -235,17 +235,17 @@ Bifrost intentionally does not accept raw passwords or private keys from agent-f
 
    ```bash
    export GPG_TTY=$(tty)
-   bifrost-mcp unlock
+   bifrost-mcp credential unlock
    ```
 
-3. Let `gpg-agent` cache the unlock for a bounded time. You usually unlock once per cache window, not before every MCP tool call. After the TTL expires or after reboot, run `bifrost-mcp unlock` again.
+3. Let `gpg-agent` cache the unlock for a bounded time. You usually unlock once per cache window, not before every MCP tool call. After the TTL expires or after reboot, run `bifrost-mcp credential unlock` again.
 
-The unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. Credentials encrypted to the same GPG key should then work until the cache expires. Use filters only if you need to target a specific credential:
+The credential unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. Credentials encrypted to the same GPG key should then work until the cache expires. Use filters only if you need to target a specific credential:
 
 ```bash
-bifrost-mcp unlock --host example-host --user admin
-bifrost-mcp unlock --purpose ssh
-bifrost-mcp unlock ssh://admin@example-host
+bifrost-mcp credential unlock --host example-host --user admin
+bifrost-mcp credential unlock --purpose ssh
+bifrost-mcp credential unlock ssh://admin@example-host
 ```
 
 A reasonable `~/.gnupg/gpg-agent.conf` is:
@@ -264,15 +264,6 @@ gpgconf --launch gpg-agent
 ```
 
 This keeps secrets encrypted at rest, requires an explicit human unlock, and limits the window in which a non-interactive MCP process can decrypt records. For unattended servers, prefer a dedicated service account and a real secret-manager integration or a tightly scoped GPG/pass store. Avoid putting GPG passphrases or SSH passwords in `.env`, shell history, or Hermes config.
-
-Run diagnostics any time setup behaves unexpectedly:
-
-```bash
-bifrost-mcp doctor
-bifrost-mcp doctor --unlock
-```
-
-The doctor command reports environment paths, missing dependencies, gopass initialization, GPG key visibility, and decrypt/unlock failures without printing secret values. With `--unlock`, it also attempts the same safe one-record warm-up used by `bifrost-mcp unlock`.
 
 Credential slugs are deterministic and safe to display:
 
@@ -316,11 +307,7 @@ bifrost-mcp credential list --host example-host
 bifrost-mcp credential show ssh://admin@example-host
 
 # Warm gpg-agent without printing the secret; use once per cache window
-bifrost-mcp unlock
-bifrost-mcp unlock --host example-host --user admin
-bifrost-mcp unlock ssh://admin@example-host
-
-# Legacy scoped form still works
+bifrost-mcp credential unlock
 bifrost-mcp credential unlock ssh://admin@example-host
 bifrost-mcp credential unlock --host example-host --user admin
 
@@ -393,6 +380,21 @@ Uploads and downloads refuse to overwrite destination files. Set `create_parents
 upload_file(session_id, "/tmp/local.tgz", "/home/user/local.tgz", create_parents=False)
 download_file(session_id, "/var/log/app.log", "/tmp/app.log", create_parents=True)
 ```
+
+## Transport Architecture
+
+Bifrost currently implements SSH sessions through `SSHHandler`. Internal session storage is transport-neutral so future transports such as WinRM can register sessions with the same metadata and lifecycle shape.
+
+Future WinRM support should add a separate `WinRMHandler` that satisfies the same internal session protocol. It should not emulate a PTY unless the WinRM backend can actually support equivalent behavior; shell-like operations such as `send_input`, `wait_for_output`, and `resize_session` must either return structured `unsupported_operation` errors or be exposed through WinRM-specific tools.
+
+WinRM is not SSH-over-HTTP. Before adding tools, decide per operation:
+
+- `run_command`: likely supported as a command/script execution primitive.
+- `send_input`: likely unsupported unless an interactive shell channel is implemented.
+- `wait_for_output`: likely unnecessary for one-shot WinRM command execution.
+- `resize_session`: unsupported.
+- SFTP upload/download: requires a separate file-transfer strategy, not SFTP.
+- sudo tools: SSH/Linux-specific; do not apply to WinRM.
 
 ## Host Key Handling
 
