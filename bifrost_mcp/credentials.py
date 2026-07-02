@@ -25,6 +25,10 @@ class CredentialNotFound(CredentialError):
     code = "missing_credential"
 
 
+class CredentialDecryptionFailed(CredentialError):
+    code = "credential_decryption_failed"
+
+
 class CredentialRecordExists(CredentialError):
     code = "credential_record_exists"
 
@@ -167,7 +171,13 @@ class CredentialStore:
         self._validate_record_type(parsed, record_type)
         result = self._run(["gopass", "show", self._record_path(slug, record_type)], input_text=None, check=False)
         if result.returncode != 0:
-            raise CredentialNotFound(f"No {record_type} credential record exists for {slug}")
+            message = (result.stderr or result.stdout or "gopass show failed").strip()
+            lowered = message.lower()
+            if "could not find password" in lowered or lowered == "not found":
+                raise CredentialNotFound(f"No {record_type} credential record exists for {slug}")
+            raise CredentialDecryptionFailed(
+                f"Failed to decrypt {record_type} credential record for {slug}. Unlock gopass/GPG and retry."
+            )
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -219,6 +229,11 @@ class CredentialStore:
         self._validate_record_type(parsed, record_type)
         result = self._run(["gopass", "rm", "-f", self._record_path(slug, record_type)], input_text=None, check=False)
         if result.returncode != 0:
+            metadata = self._load_index().get(slug)
+            if metadata is not None and self._metadata_has_record_type(metadata, record_type):
+                reconciled = self._reconcile_metadata(metadata)
+                if reconciled is None or not self._metadata_has_record_type(reconciled, record_type):
+                    return self._update_index(slug, record_type, exists=False)
             raise CredentialNotFound(f"No {record_type} credential record exists for {slug}")
         return self._update_index(slug, record_type, exists=False)
 
@@ -240,7 +255,7 @@ class CredentialStore:
         host_filter = host.strip().lower() if isinstance(host, str) and host.strip() else None
         user_filter = user.strip() if isinstance(user, str) and user.strip() else None
         rows = []
-        for metadata in self._load_index().values():
+        for metadata in self._reconcile_index().values():
             if host_filter is not None and metadata.canonical_host != host_filter:
                 continue
             if user_filter is not None and metadata.username != user_filter:
@@ -252,7 +267,7 @@ class CredentialStore:
 
     def show_metadata(self, slug: str) -> CredentialMetadata:
         parse_slug(slug)
-        metadata = self._load_index().get(slug)
+        metadata = self._reconcile_index().get(slug)
         if metadata is None:
             raise CredentialNotFound(f"No credential metadata exists for {slug}")
         return metadata
@@ -310,6 +325,59 @@ class CredentialStore:
                 has_key=bool(data.get("has_key", False)),
             )
         return rows
+
+    def _reconcile_index(self) -> dict[str, CredentialMetadata]:
+        rows = self._load_index()
+        reconciled: dict[str, CredentialMetadata] = {}
+        changed = False
+        for slug, metadata in rows.items():
+            updated = self._reconcile_metadata(metadata)
+            if updated is None:
+                changed = True
+                continue
+            reconciled[slug] = updated
+            if updated != metadata:
+                changed = True
+        if changed:
+            self._save_index(reconciled)
+        return reconciled
+
+    def _reconcile_metadata(self, metadata: CredentialMetadata) -> CredentialMetadata | None:
+        password_exists = self._record_file_exists(metadata.slug, "password") if metadata.has_password else None
+        key_exists = self._record_file_exists(metadata.slug, "key") if metadata.has_key else None
+        if password_exists is None and key_exists is None:
+            return metadata
+        reconciled = CredentialMetadata(
+            slug=metadata.slug,
+            purpose=metadata.purpose,
+            username=metadata.username,
+            canonical_host=metadata.canonical_host,
+            has_password=metadata.has_password if password_exists is None else password_exists,
+            has_key=metadata.has_key if key_exists is None else key_exists,
+        )
+        if not reconciled.has_password and not reconciled.has_key:
+            return None
+        return reconciled
+
+    def _record_file_exists(self, slug: str, record_type: CredentialRecordType) -> bool | None:
+        record_file = self._record_file_path(slug, record_type)
+        if record_file is None:
+            return None
+        return record_file.exists()
+
+    def _record_file_path(self, slug: str, record_type: CredentialRecordType) -> Path | None:
+        password_store_dir = self._resolved_password_store_dir()
+        if password_store_dir is None:
+            return None
+        record_path = password_store_dir / self._record_path(slug, record_type)
+        gpg_path = record_path.with_suffix(".gpg")
+        if gpg_path.exists() or not record_path.exists():
+            return gpg_path
+        return record_path
+
+    @staticmethod
+    def _metadata_has_record_type(metadata: CredentialMetadata, record_type: CredentialRecordType) -> bool:
+        return metadata.has_key if record_type == "key" else metadata.has_password
 
     def _save_index(self, rows: dict[str, CredentialMetadata]) -> None:
         self._index_path.parent.mkdir(parents=True, exist_ok=True)

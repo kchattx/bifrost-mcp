@@ -2,9 +2,9 @@
 
 Bifrost MCP exposes an MCP server for managing persistent interactive SSH sessions. Codex, Hermes Agent, or another MCP client can install this project locally and use it over stdio through the `bifrost-mcp` entrypoint.
 
-Bifrost MCP is an MCP server for bridging AI agents to persistent remote SSH sessions, with command execution, terminal interaction, sudo cache management, and SFTP file transfer. It uses Paramiko as its SSH client; it does not shell out to `ssh`, does not use `sshpass`, and does not assume access to host-mounted key files inside a container. Command execution is MCP-first and runs through the existing interactive shell session; `exec_command` is intentionally not implemented.
+Bifrost MCP is an MCP server for bridging AI agents to remote-admin sessions. Today it supports persistent interactive SSH sessions plus bounded WinRM command-execution sessions. It uses Paramiko as its SSH client; it does not shell out to `ssh`, does not use `sshpass`, and does not assume access to host-mounted key files inside a container. SSH command execution is MCP-first and runs through the existing interactive shell session; `exec_command` is intentionally not implemented.
 
-Bifrost MCP currently focuses on SSH-backed remote shells. Future versions are intended to extend the same MCP-first control plane to additional remote-management transports such as WinRM, while preserving the same safety model: server-side credential resolution, explicit session state, and no secret material returned to the agent.
+Bifrost MCP preserves the same safety model across transports: server-side credential resolution, explicit session state, and no secret material returned to the agent.
 
 ## Requirements
 
@@ -240,7 +240,7 @@ Bifrost intentionally does not accept raw passwords or private keys from agent-f
 
 3. Let `gpg-agent` cache the unlock for a bounded time. You usually unlock once per cache window, not before every MCP tool call. After the TTL expires or after reboot, run `bifrost-mcp credential unlock` again.
 
-The credential unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. Credentials encrypted to the same GPG key should then work until the cache expires. Use filters only if you need to target a specific credential:
+The credential unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. Credentials encrypted to the same GPG key should then work until the cache expires. With no filters, `bifrost-mcp credential unlock` auto-selects one deterministic stored credential. Use filters only if you need to target a specific credential:
 
 ```bash
 bifrost-mcp credential unlock --host example-host --user admin
@@ -273,7 +273,7 @@ Credential slugs are deterministic and safe to display:
 
 Rules:
 
-- `purpose` is `ssh` or `sudo`.
+- `purpose` is `ssh`, `sudo`, or `winrm`.
 - Hosts are lowercase.
 - Include `:<port>` only for non-default SSH ports.
 - SSH credentials can have a password record, a key record, or both; key records are preferred automatically.
@@ -306,8 +306,10 @@ printf '%s' 'ssh-password' | bifrost-mcp credential add ssh://admin@example-host
 # Private key record under the same SSH slug
 bifrost-mcp credential add ssh://admin@example-host --key ~/.ssh/id_ed25519
 
-# Metadata only; never prints secrets
+# Metadata only; never prints secrets. Defaults to a human-readable table;
+# use --json when scripting.
 bifrost-mcp credential list --host example-host
+bifrost-mcp credential list --host example-host --json
 bifrost-mcp credential show ssh://admin@example-host
 
 # Warm gpg-agent without printing the secret; use once per cache window
@@ -333,11 +335,12 @@ bifrost-mcp credential remove ssh://admin@example-host --password
 
 - `list_credentials(host)`: lists non-secret user metadata for one host, grouped by username.
 - `create_ssh_session(host, username, port=22)`: opens a new interactive SSH session using stored `ssh://...` credentials.
+- `create_winrm_session(host, username, port=5985, use_ssl=False, auth="ntlm")`: opens a WinRM session using stored `winrm://...` password credentials.
 - `send_input(session_id, text)`: sends raw text to an existing session.
 - `send_control(session_id, key)`: sends one of `ctrl-c`, `ctrl-d`, `ctrl-z`, `enter`, or `escape`.
 - `read_output(session_id, clear_buffer=True)`: reads buffered output from a session.
 - `wait_for_output(session_id, pattern, timeout, regex=True, clear_buffer=True)`: waits until buffered output matches a regex or literal.
-- `run_command(session_id, command, timeout=30)`: runs a command inside the existing interactive shell and waits for a sentinel.
+- `run_command(session_id, command, timeout=30)`: runs a command inside the existing transport. For SSH it uses the interactive shell and waits for a sentinel. For WinRM it executes PowerShell script text via pywinrm `run_ps()` and returns stdout/stderr/exit code.
 - `check_sudo_cache(session_id, timeout=10)`: runs `sudo -n -v` to check whether sudo is already warm.
 - `warm_sudo_cache(session_id, timeout=10)`: derives `sudo://<session-user>@<session-host>`, sends the password server-side, and warms sudo with `sudo -S ... -v`.
 - `clear_sudo_cache(session_id, timeout=10)`: invalidates sudo timestamp state with `sudo -k`.
@@ -361,6 +364,50 @@ Agent-facing SSH session creation does **not** accept `password`, `auth_mode`, `
 Use `run_command` for ordinary non-interactive shell commands. It runs in the current interactive shell session, preserving state like `cd`, exported variables, and activated virtual environments. If a timeout occurs, Bifrost MCP returns partial output and leaves the remote command running; use `send_control(session_id, "ctrl-c")` if interruption is appropriate.
 
 Use `send_input`, `wait_for_output`, and `send_control` for prompts, installers, pagers, REPLs, and terminal programs.
+
+## WinRM Support
+
+WinRM sessions are created with stored `winrm://...` password credentials and a down-level domain username such as `EXAMPLE\\administrator` when domain auth is needed.
+
+```bash
+bifrost-mcp credential add 'winrm://EXAMPLE\\administrator@example-host' --password
+```
+
+```text
+create_winrm_session(host="example-host", username="EXAMPLE\\administrator", port=5985, use_ssl=false, auth="ntlm")
+```
+
+Supported in v1:
+
+- `create_winrm_session`
+- `run_command`
+- `list_sessions`
+- `close_ssh_session` (closes the stored session regardless of transport)
+
+When using `run_command` on a WinRM session, pass PowerShell script text directly:
+
+```powershell
+Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' |
+  Select-Object DeviceID, Size, FreeSpace |
+  ConvertTo-Json -Compress
+```
+
+Do not wrap it in `powershell -Command ...`. Bifrost already uses pywinrm `run_ps()`, so nesting PowerShell causes quoting foot-guns like outer-shell expansion of `$_`.
+
+Not supported in v1 for WinRM:
+
+- `send_input`
+- `send_control`
+- `resize_session`
+- `read_output`
+- `wait_for_output`
+- `check_sudo_cache`
+- `warm_sudo_cache`
+- `clear_sudo_cache`
+- `upload_file`
+- `download_file`
+
+These return structured `unsupported_operation` errors instead of pretending WinRM behaves like an interactive SSH PTY.
 
 ## Sudo Cache Warming Flow
 

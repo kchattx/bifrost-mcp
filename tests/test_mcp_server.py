@@ -4,11 +4,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import bifrost_mcp.mcp_server as mcp_server
-from bifrost_mcp.credentials import CredentialMetadata, CredentialNotFound, StoredSSHAuth
+from bifrost_mcp.credentials import CredentialDecryptionFailed, CredentialMetadata, CredentialNotFound, CredentialRecord, CredentialStore, StoredSSHAuth
+from bifrost_mcp.session import RemoteSessionHandler
 
 
 class FakeHandler:
@@ -30,24 +32,77 @@ class FakeHandler:
         if self.close_raises:
             raise RuntimeError("already closed")
 
+    def send_input(self, text):
+        self.last_sent = text
+
+    def send_control(self, key):
+        self.last_control = key
+
+    def resize_session(self, width, height):
+        self.last_resize = (width, height)
+
+    def read_output(self):
+        return "output"
+
+    def flush_output_buffer(self):
+        return "output"
+
+    def wait_for_output(self, pattern, timeout, regex=True, clear_buffer=True):
+        return {"status": "matched", "output": "output"}
+
+    def run_command(self, command, timeout=30):
+        return {"status": "completed", "stdout": "", "stderr": "", "exit_code": 0}
+
+    def check_sudo_cache(self, timeout=10):
+        return {"status": "ok"}
+
+    def warm_sudo_cache(self, sudo_password, timeout=10):
+        return {"status": "ok"}
+
+    def clear_sudo_cache(self, timeout=10):
+        return {"status": "ok"}
+
+    def upload_file(self, local_path, remote_path, create_parents=False):
+        return {"status": "ok"}
+
+    def download_file(self, remote_path, local_path, create_parents=False):
+        return {"status": "ok"}
+
 
 class FakeStore:
-    def __init__(self, auth=None, rows=None, sudo_password="sudo-secret"):
+    def __init__(self, auth=None, rows=None, sudo_password="sudo-secret", records=None):
         self.auth = auth
         self.rows = rows or []
         self.sudo_password = sudo_password
+        self.records = records or {}
         self.stored = []
         self.removed = []
+        self.auth_exc: Exception | None = None
+        self.record_exc: Exception | None = None
+        self.sudo_exc: Exception | None = None
 
     def resolve_ssh_auth(self, slug):
+        if self.auth_exc is not None:
+            raise self.auth_exc
         if self.auth is None:
             raise CredentialNotFound("No stored SSH credential exists for user@example.com")
         self.resolved_slug = slug
         return self.auth
 
     def resolve_sudo_password(self, slug):
+        if self.sudo_exc is not None:
+            raise self.sudo_exc
         self.sudo_slug = slug
         return self.sudo_password
+
+    def get_record(self, slug, record_type):
+        self.record_slug = slug
+        self.record_type = record_type
+        if self.record_exc is not None:
+            raise self.record_exc
+        if (slug, record_type) not in self.records:
+            raise CredentialNotFound(f"No {record_type} credential record exists for {slug}")
+        return self.records[(slug, record_type)]
 
     def list_metadata(self, host=None, user=None, purpose=None):
         rows = self.rows
@@ -198,8 +253,241 @@ def test_create_ssh_session_missing_credential_returns_structured_error():
     assert result["error"]["code"] == "missing_credential"
 
 
+
+def test_create_ssh_session_decryption_failure_returns_structured_error():
+    store = FakeStore()
+    store.auth_exc = CredentialDecryptionFailed("unlock gpg")
+
+    result = mcp_server._create_ssh_session_impl("example.com", "user", store=cast(CredentialStore, store))
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "credential_decryption_failed"
+
+
+
+def test_create_ssh_session_retries_once_after_unlock(monkeypatch):
+    opened = {}
+
+    class FakeSSHHandler:
+        transport = "ssh"
+
+        def open_session(self, **kwargs):
+            opened.update(kwargs)
+            self.session_id = "sid"
+            self.host = kwargs["host"]
+            self.canonical_host = "example.com"
+            self.username = kwargs["username"]
+            self.port = kwargs["port"]
+            self.created_at = time.monotonic()
+            self.last_activity_at = self.created_at
+            return "sid"
+
+    class RetryStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.resolve_calls = 0
+
+        def resolve_ssh_auth(self, slug):
+            self.resolve_calls += 1
+            self.resolved_slug = slug
+            if self.resolve_calls == 1:
+                raise CredentialDecryptionFailed("unlock gpg")
+            return StoredSSHAuth(auth_type="password", secret="ssh-secret")
+
+    monkeypatch.setattr(mcp_server, "SSHHandler", FakeSSHHandler)
+    store = RetryStore()
+
+    result = mcp_server._create_ssh_session_impl("Example.COM", "user", store=cast(CredentialStore, store))
+
+    assert result["status"] == "created"
+    assert store.unlocked == ("ssh://user@example.com", None)
+    assert store.resolve_calls == 2
+    assert opened["password"] == "ssh-secret"
+
+
+def test_create_winrm_session_derives_slug_and_uses_password_record(monkeypatch):
+    opened = {}
+
+    class FakeWinRMHandler:
+        transport = "winrm"
+
+        def open_session(self, **kwargs):
+            opened.update(kwargs)
+            self.session_id = "winrm-sid"
+            self.host = kwargs["host"]
+            self.canonical_host = "example.com"
+            self.username = kwargs["username"]
+            self.port = kwargs["port"]
+            self.created_at = time.monotonic()
+            self.last_activity_at = self.created_at
+            return "winrm-sid"
+
+    monkeypatch.setattr(mcp_server, "WinRMHandler", FakeWinRMHandler)
+    store = FakeStore(records={
+        ("winrm://EXAMPLE\\user@example.com", "password"): CredentialRecord(
+            slug="winrm://EXAMPLE\\user@example.com",
+            record_type="password",
+            secret="winrm-secret",
+        )
+    })
+
+    result = mcp_server._create_winrm_session_impl("Example.COM", "EXAMPLE\\user", store=store)
+
+    assert store.record_slug == "winrm://EXAMPLE\\user@example.com"
+    assert opened["password"] == "winrm-secret"
+    assert opened["auth"] == "ntlm"
+    assert opened["use_ssl"] is False
+    assert result == {
+        "status": "created",
+        "session_id": "winrm-sid",
+        "transport": "winrm",
+        "host": "example.com",
+        "username": "EXAMPLE\\user",
+        "port": 5985,
+    }
+
+
+def test_create_winrm_session_missing_credential_returns_structured_error():
+    result = mcp_server._create_winrm_session_impl("example.com", "EXAMPLE\\user", store=FakeStore(records={}))
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "missing_credential"
+
+
+
+def test_create_winrm_session_decryption_failure_returns_structured_error():
+    store = FakeStore(records={})
+    store.record_exc = CredentialDecryptionFailed("unlock gpg")
+
+    result = mcp_server._create_winrm_session_impl("example.com", "EXAMPLE\\user", store=cast(CredentialStore, store))
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "credential_decryption_failed"
+
+
+
+def test_create_winrm_session_retries_once_after_unlock(monkeypatch):
+    opened = {}
+
+    class FakeWinRMHandler:
+        transport = "winrm"
+
+        def open_session(self, **kwargs):
+            opened.update(kwargs)
+            self.session_id = "winrm-sid"
+            self.host = kwargs["host"]
+            self.canonical_host = "example.com"
+            self.username = kwargs["username"]
+            self.port = kwargs["port"]
+            self.created_at = time.monotonic()
+            self.last_activity_at = self.created_at
+            return "winrm-sid"
+
+    class RetryStore(FakeStore):
+        def __init__(self):
+            super().__init__(records={})
+            self.record_calls = 0
+
+        def get_record(self, slug, record_type):
+            self.record_calls += 1
+            self.record_slug = slug
+            self.record_type = record_type
+            if self.record_calls == 1:
+                raise CredentialDecryptionFailed("unlock gpg")
+            return CredentialRecord(slug=slug, record_type=record_type, secret="winrm-secret")
+
+    monkeypatch.setattr(mcp_server, "WinRMHandler", FakeWinRMHandler)
+    store = RetryStore()
+
+    result = mcp_server._create_winrm_session_impl("Example.COM", "EXAMPLE\\user", store=cast(CredentialStore, store))
+
+    assert result["status"] == "created"
+    assert store.unlocked == ("winrm://EXAMPLE\\user@example.com", "password")
+    assert store.record_calls == 2
+    assert opened["password"] == "winrm-secret"
+
+
+def test_create_winrm_session_rejects_unsupported_auth_mode():
+    result = mcp_server._create_winrm_session_impl(
+        "example.com",
+        "EXAMPLE\\user",
+        auth="kerberos",
+        store=FakeStore(records={}),
+    )
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "invalid_auth"
+
+
+def test_winrm_impl_helpers_return_unsupported_operation_for_interactive_features():
+    handler = FakeHandler("winrm-1")
+    handler.transport = "winrm"
+    mcp_server._sessions["winrm-1"] = handler
+
+    assert mcp_server._send_input_impl("winrm-1", "dir\n")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._send_control_impl("winrm-1", "ctrl-c")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._resize_session_impl("winrm-1", 120, 40)["error"]["code"] == "unsupported_operation"
+    assert mcp_server._read_output_impl("winrm-1")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._wait_for_output_impl("winrm-1", "ready", 5)["error"]["code"] == "unsupported_operation"
+    assert mcp_server._check_sudo_cache_impl("winrm-1")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._warm_sudo_cache_impl("winrm-1")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._clear_sudo_cache_impl("winrm-1")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._upload_file_impl("winrm-1", "/tmp/a", "/tmp/b")["error"]["code"] == "unsupported_operation"
+    assert mcp_server._download_file_impl("winrm-1", "/tmp/a", "/tmp/b")["error"]["code"] == "unsupported_operation"
+
+
+
+def test_warm_sudo_cache_decryption_failure_returns_structured_error(monkeypatch):
+    handler = FakeHandler("ssh-1")
+    mcp_server._sessions["ssh-1"] = cast(RemoteSessionHandler, handler)
+
+    class RaisingStore:
+        def resolve_sudo_password(self, slug):
+            raise CredentialDecryptionFailed("unlock gpg")
+
+        def unlock_record(self, slug, record_type=None):
+            raise CredentialDecryptionFailed("unlock gpg")
+
+    monkeypatch.setattr(mcp_server, "CredentialStore", lambda: RaisingStore())
+
+    result = mcp_server._warm_sudo_cache_impl("ssh-1")
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "credential_decryption_failed"
+
+
+
+def test_warm_sudo_cache_retries_once_after_unlock(monkeypatch):
+    handler = FakeHandler("ssh-1")
+    mcp_server._sessions["ssh-1"] = cast(RemoteSessionHandler, handler)
+
+    class RetryStore:
+        def __init__(self):
+            self.calls = 0
+            self.unlocked = None
+
+        def resolve_sudo_password(self, slug):
+            self.calls += 1
+            if self.calls == 1:
+                raise CredentialDecryptionFailed("unlock gpg")
+            return "sudo-secret"
+
+        def unlock_record(self, slug, record_type=None):
+            self.unlocked = (slug, record_type)
+            return {"status": "unlocked", "slug": slug, "record_type": record_type or "password"}
+
+    store = RetryStore()
+    monkeypatch.setattr(mcp_server, "CredentialStore", lambda: store)
+
+    result = mcp_server._warm_sudo_cache_impl("ssh-1")
+
+    assert result["status"] == "ok"
+    assert store.unlocked == ("sudo://user@example.com", "password")
+    assert store.calls == 2
+
+
 def test_credential_cli_add_password_reads_piped_stdin(monkeypatch, capsys):
-    args = mcp_server._build_parser().parse_args(["credential", "add", "ssh://user@example.com"])
+    args = mcp_server._build_parser().parse_args(["credential", "add", "  ssh://user@example.com  "])
     store = FakeStore()
     monkeypatch.setattr(sys, "stdin", io.StringIO("secret\n"))
 
@@ -302,9 +590,54 @@ def test_credential_cli_add_key_reads_file(tmp_path):
 
 
 
+def test_credential_cli_list_defaults_to_table(capsys):
+    rows = [
+        CredentialMetadata("ssh://deploy@example.com", "ssh", "deploy", "example.com", has_password=True),
+        CredentialMetadata("winrm://BYU\\admin@host.example.com", "winrm", "BYU\\admin", "host.example.com", has_password=True),
+    ]
+    args = mcp_server._build_parser().parse_args(["credential", "list"])
+    store = FakeStore(rows=rows)
+
+    rc = mcp_server._handle_credential_cli(args, store=cast(CredentialStore, store))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Bifrost credentials:" in out
+    assert "Purpose" in out
+    assert "Records" in out
+    assert "ssh://deploy@example.com" in out
+    assert "winrm://BYU\\admin@host.example.com" in out
+
+
+
+def test_credential_cli_list_json_preserves_machine_readable_output(capsys):
+    rows = [CredentialMetadata("ssh://deploy@example.com", "ssh", "deploy", "example.com", has_password=True)]
+    args = mcp_server._build_parser().parse_args(["credential", "list", "--json"])
+    store = FakeStore(rows=rows)
+
+    rc = mcp_server._handle_credential_cli(args, store=cast(CredentialStore, store))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["credentials"][0]["slug"] == "ssh://deploy@example.com"
+
+
+
+def test_credential_cli_show_and_remove_strip_slug(capsys):
+    show_args = mcp_server._build_parser().parse_args(["credential", "show", "  ssh://user@example.com  "])
+    remove_args = mcp_server._build_parser().parse_args(["credential", "remove", "  ssh://user@example.com  ", "--password"])
+    store = FakeStore()
+
+    assert mcp_server._handle_credential_cli(show_args, store=cast(CredentialStore, store)) == 0
+    assert json.loads(capsys.readouterr().out)["credential"]["slug"] == "ssh://user@example.com"
+    assert mcp_server._handle_credential_cli(remove_args, store=cast(CredentialStore, store)) == 0
+    assert store.removed == [("ssh://user@example.com", "password")]
+
+
 
 def test_credential_cli_unlock_accepts_exact_slug(capsys):
-    args = mcp_server._build_parser().parse_args(["credential", "unlock", "ssh://user@example.com"])
+    args = mcp_server._build_parser().parse_args(["credential", "unlock", "  ssh://user@example.com  "])
     store = FakeStore()
 
     rc = mcp_server._handle_credential_cli(args, store=store)
@@ -322,6 +655,23 @@ def test_credential_cli_unlock_resolves_single_host_user_match(capsys):
     store = FakeStore(rows=rows)
 
     rc = mcp_server._handle_credential_cli(args, store=store)
+
+    assert rc == 0
+    assert store.unlocked == ("ssh://deploy@example.com", "password")
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["slug"] == "ssh://deploy@example.com"
+
+
+
+def test_credential_cli_unlock_auto_selects_deterministic_record(capsys):
+    rows = [
+        CredentialMetadata("winrm://BYU\\deploy@example.com", "winrm", "BYU\\deploy", "example.com", has_password=True),
+        CredentialMetadata("ssh://deploy@example.com", "ssh", "deploy", "example.com", has_password=True),
+    ]
+    args = mcp_server._build_parser().parse_args(["credential", "unlock"])
+    store = FakeStore(rows=rows)
+
+    rc = mcp_server._handle_credential_cli(args, store=cast(CredentialStore, store))
 
     assert rc == 0
     assert store.unlocked == ("ssh://deploy@example.com", "password")

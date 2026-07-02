@@ -21,6 +21,42 @@ class FakeRemoteSession:
     def close_session(self) -> None:
         self.closed = True
 
+    def send_input(self, text: str) -> None:
+        return None
+
+    def send_control(self, key: str) -> None:
+        return None
+
+    def resize_session(self, width: int, height: int) -> None:
+        return None
+
+    def read_output(self) -> str:
+        return ""
+
+    def flush_output_buffer(self) -> str:
+        return ""
+
+    def wait_for_output(self, pattern: str, timeout: float, regex: bool = True, clear_buffer: bool = True) -> dict[str, object]:
+        return {"status": "matched", "output": ""}
+
+    def run_command(self, command: str, timeout: float = 30) -> dict[str, object]:
+        return {"status": "completed", "stdout": "", "stderr": "", "exit_code": 0}
+
+    def check_sudo_cache(self, timeout: float = 10) -> dict[str, object]:
+        return {"status": "ok"}
+
+    def warm_sudo_cache(self, sudo_password: str, timeout: float = 10) -> dict[str, object]:
+        return {"status": "ok"}
+
+    def clear_sudo_cache(self, timeout: float = 10) -> dict[str, object]:
+        return {"status": "ok"}
+
+    def upload_file(self, local_path: str, remote_path: str, create_parents: bool = False) -> dict[str, object]:
+        return {"status": "ok"}
+
+    def download_file(self, remote_path: str, local_path: str, create_parents: bool = False) -> dict[str, object]:
+        return {"status": "ok"}
+
 
 def test_registry_accepts_transport_neutral_session():
     handler: RemoteSessionHandler = FakeRemoteSession()
@@ -32,6 +68,18 @@ def test_registry_accepts_transport_neutral_session():
     assert info.session_id == "fake-1"
     assert info.transport == "fake"
     assert info.to_dict()["transport"] == "fake"
+
+
+def test_registry_lists_winrm_transport():
+    handler: RemoteSessionHandler = FakeRemoteSession("winrm-1")
+    handler.transport = "winrm"
+    registry = SessionRegistry(sessions={})
+
+    registry.register(handler)
+
+    [info] = registry.list_info()
+    assert info.session_id == "winrm-1"
+    assert info.transport == "winrm"
 
 
 def test_transport_neutral_modules_do_not_reference_ssh_handler():

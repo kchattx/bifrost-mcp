@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from bifrost_mcp.credentials import (
+    CredentialDecryptionFailed,
     CredentialNotFound,
     CredentialRecordExists,
     CredentialStore,
@@ -26,7 +27,10 @@ class FakeRunner:
         if command == "show":
             if path not in self.records:
                 return subprocess.CompletedProcess(args, 1, "", "not found")
-            return subprocess.CompletedProcess(args, 0, self.records[path], "")
+            record = self.records[path]
+            if isinstance(record, subprocess.CompletedProcess):
+                return record
+            return subprocess.CompletedProcess(args, 0, record, "")
         if command == "insert":
             self.records[path] = input
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -103,6 +107,17 @@ def test_get_record_validates_json_and_exact_lookup(tmp_path):
         store.get_record("ssh://other@example.com", "password")
 
 
+
+def test_get_record_surfaces_decryption_failures_separately(tmp_path):
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+    path = store._record_path("ssh://user@example.com", "password")
+    runner.records[path] = subprocess.CompletedProcess(["gopass", "show", path], 2, "", "Error: exit status 2.")
+
+    with pytest.raises(CredentialDecryptionFailed, match="Failed to decrypt password credential record"):
+        store.get_record("ssh://user@example.com", "password")
+
+
 def test_malformed_records_fail_clearly(tmp_path):
     runner = FakeRunner()
     store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
@@ -161,3 +176,46 @@ def test_metadata_filters_exclude_secrets(tmp_path):
         "has_key": False,
     }
     assert "secret" not in json.dumps([row.to_dict() for row in store.list_metadata()])
+
+
+
+def test_list_and_show_prune_stale_index_entries_when_backing_record_is_missing(tmp_path):
+    runner = FakeRunner()
+    password_store_dir = tmp_path / "password-store"
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json", password_store_dir=password_store_dir)
+    slug = "ssh://user@example.com"
+
+    store.store_record(slug, "password", "secret")
+    record_file = (password_store_dir / store._record_path(slug, "password")).with_suffix(".gpg")
+    record_file.parent.mkdir(parents=True, exist_ok=True)
+    record_file.write_text("ciphertext", encoding="utf-8")
+    record_file.unlink()
+    runner.records.pop(store._record_path(slug, "password"))
+
+    assert store.list_metadata() == []
+    with pytest.raises(CredentialNotFound, match="No credential metadata exists"):
+        store.show_metadata(slug)
+    assert json.loads((tmp_path / "credentials.json").read_text(encoding="utf-8")) == {}
+
+
+
+def test_remove_record_prunes_stale_index_entries_when_gopass_record_is_already_gone(tmp_path):
+    runner = FakeRunner()
+    password_store_dir = tmp_path / "password-store"
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json", password_store_dir=password_store_dir)
+    slug = "ssh://user@example.com"
+
+    metadata = store.store_record(slug, "password", "secret")
+    record_file = (password_store_dir / store._record_path(slug, "password")).with_suffix(".gpg")
+    record_file.parent.mkdir(parents=True, exist_ok=True)
+    record_file.write_text("ciphertext", encoding="utf-8")
+    record_file.unlink()
+    runner.records.pop(store._record_path(slug, "password"))
+
+    removed = store.remove_record(slug, "password")
+
+    assert removed.slug == metadata.slug
+    assert removed.has_password is False
+    assert removed.has_key is False
+    assert store.list_metadata() == []
+    assert json.loads((tmp_path / "credentials.json").read_text(encoding="utf-8")) == {}
