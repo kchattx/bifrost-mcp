@@ -86,9 +86,11 @@ def test_winrm_handler_run_command_passes_powershell_script_text_to_run_ps(monke
 
 
 def test_winrm_handler_run_command_returns_nonzero_exit(monkeypatch):
+    calls = {}
+
     class FakeSession:
         def __init__(self, target, auth, transport, server_cert_validation, read_timeout_sec, operation_timeout_sec):
-            pass
+            calls["server_cert_validation"] = server_cert_validation
 
         def run_ps(self, command):
             return SimpleNamespace(status_code=5, std_out=b"", std_err=b"Access denied")
@@ -99,6 +101,7 @@ def test_winrm_handler_run_command_returns_nonzero_exit(monkeypatch):
 
     result = handler.run_command("Get-Item C:\\")
 
+    assert calls["server_cert_validation"] == "validate"
     assert result == {
         "status": "completed",
         "stdout": "",

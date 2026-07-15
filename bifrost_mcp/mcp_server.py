@@ -36,7 +36,8 @@ _registry = SessionRegistry(idle_timeout_seconds=_IDLE_TIMEOUT_SECONDS, sessions
 
 def _server_instructions() -> str:
     return (
-        "Bifrost MCP provides tools to create, interact with, read from, transfer files for, and close SSH sessions. "
+        "Bifrost MCP provides interactive SSH sessions with file transfer and bounded WinRM command execution. "
+        "Sessions for either transport can be listed and closed. "
         "Secrets are resolved server-side from gopass credentials; never ask the agent to pass passwords."
     )
 
@@ -146,6 +147,15 @@ def _create_winrm_session_impl(
     store: CredentialStore | None = None,
 ) -> dict[str, Any]:
     _validate_create_session_inputs(host, username, port)
+    domain, separator, account = username.partition("\\")
+    if (
+        "@" in username
+        or not separator
+        or not domain.strip()
+        or not account.strip()
+        or "\\" in account
+    ):
+        return _error("invalid_username", "WinRM username must use DOMAIN\\user format; UPN usernames are not supported.")
     if auth not in ("ntlm", "basic"):
         return _error("invalid_auth", "WinRM auth must be 'ntlm' or 'basic'.")
     canonical_host = _canonicalize_winrm_host(host, port, use_ssl=use_ssl)
@@ -399,8 +409,8 @@ def create_server() -> FastMCP:
     def list_sessions() -> dict[str, Any]:
         return _list_sessions_impl()
 
-    @server.tool(description="Close an active SSH session and remove it from server state.")
-    def close_ssh_session(session_id: str) -> dict[str, str]:
+    @server.tool(description="Close an active remote session and remove it from server state.")
+    def close_session(session_id: str) -> dict[str, str]:
         return _close_session_impl(session_id)
 
     return server

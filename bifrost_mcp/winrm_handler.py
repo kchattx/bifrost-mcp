@@ -111,7 +111,7 @@ class WinRMHandler:
             target=self._build_endpoint(),
             auth=(self.username, self._password),
             transport=self._auth,
-            server_cert_validation="ignore",
+            server_cert_validation="validate" if self._use_ssl else "ignore",
             read_timeout_sec=read_timeout_sec,
             operation_timeout_sec=operation_timeout_sec,
         )

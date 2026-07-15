@@ -275,16 +275,17 @@ Rules:
 
 - `purpose` is `ssh`, `sudo`, or `winrm`.
 - Hosts are lowercase.
-- Include `:<port>` only for non-default SSH ports.
+- Include `:<port>` for non-default SSH ports. WinRM credential slugs omit the conventional HTTP/5985 and HTTPS/5986 ports; include other ports.
 - SSH credentials can have a password record, a key record, or both; key records are preferred automatically.
 - Sudo credentials are password records only.
+- WinRM usernames must use down-level `DOMAIN\user` format. UPN usernames such as `user@example.edu` are not supported.
 
 Examples:
 
 ```text
 ssh://admin@example-host
 sudo://admin@example-host
-winrm://admin@example-host
+winrm://BYU\administrator@windows-host
 ssh://deploy@example-host:2222
 ```
 
@@ -298,7 +299,7 @@ Credentials are managed locally through CLI commands. These commands assume `gop
 # sudo://<user>@<host> when provided.
 bifrost-mcp credential add ssh://admin@example-host --password
 bifrost-mcp credential add sudo://admin@example-host --password
-bifrost-mcp credential add winrm://admin@example-host --password
+bifrost-mcp credential add 'winrm://BYU\administrator@windows-host' --password
 
 # Or read from piped stdin for scripts
 printf '%s' 'ssh-password' | bifrost-mcp credential add ssh://admin@example-host --password
@@ -348,7 +349,9 @@ bifrost-mcp credential remove ssh://admin@example-host --password
 - `download_file(session_id, remote_path, local_path, create_parents=False)`: downloads one remote file to an MCP-server-local destination file path without overwriting.
 - `resize_session(session_id, width, height)`: resizes the remote PTY.
 - `list_sessions()`: returns active session metadata and idle time.
-- `close_ssh_session(session_id)`: closes a session and removes it from server state.
+- `close_session(session_id)`: closes any SSH or WinRM session and removes it from server state.
+
+Versions before this change exposed `close_ssh_session`; clients must switch to `close_session`.
 
 ## Credential-Backed SSH Flow
 
@@ -367,14 +370,14 @@ Use `send_input`, `wait_for_output`, and `send_control` for prompts, installers,
 
 ## WinRM Support
 
-WinRM sessions are created with stored `winrm://...` password credentials and a down-level domain username such as `EXAMPLE\\administrator` when domain auth is needed.
+WinRM sessions are created with stored `winrm://...` password credentials. Only down-level usernames such as `BYU\administrator` are supported; UPN usernames such as `administrator@ad.byu.edu` are rejected.
 
 ```bash
-bifrost-mcp credential add 'winrm://EXAMPLE\\administrator@example-host' --password
+bifrost-mcp credential add 'winrm://BYU\administrator@windows-host' --password
 ```
 
 ```text
-create_winrm_session(host="example-host", username="EXAMPLE\\administrator", port=5985, use_ssl=false, auth="ntlm")
+create_winrm_session(host="windows-host", username="BYU\\administrator", port=5985, use_ssl=false, auth="ntlm")
 ```
 
 Supported in v1:
@@ -382,7 +385,9 @@ Supported in v1:
 - `create_winrm_session`
 - `run_command`
 - `list_sessions`
-- `close_ssh_session` (closes the stored session regardless of transport)
+- `close_session`
+
+`use_ssl=False` uses HTTP, and the API's default `port=5985` matches the conventional HTTP endpoint. For the conventional HTTPS endpoint, set both `use_ssl=True` and `port=5986`; enabling SSL does not change the port automatically. HTTPS validates the target certificate through the Bifrost runtime's configured CA trust bundle/store. For private PKI, install the issuing CA there; do not bypass certificate validation. Basic authentication must only be used with `use_ssl=True`; Basic over HTTP is unsafe.
 
 When using `run_command` on a WinRM session, pass PowerShell script text directly:
 
@@ -408,6 +413,27 @@ Not supported in v1 for WinRM:
 - `download_file`
 
 These return structured `unsupported_operation` errors instead of pretending WinRM behaves like an interactive SSH PTY.
+
+### Operator-only real WinRM verification
+
+This is a manual operator gate, not an automated agent test. Run it only against an authorized Windows endpoint whose certificate is trusted by the Bifrost runtime:
+
+```bash
+# The prompt reads the password without echoing it.
+bifrost-mcp credential add 'winrm://BYU\administrator@windows-host' --password
+```
+
+Then make these MCP calls:
+
+```text
+create_winrm_session(host="windows-host", username="BYU\\administrator", port=5986, use_ssl=true, auth="ntlm")
+run_command(session_id="...", command="hostname")
+run_command(session_id="...", command="$PSVersionTable.PSVersion.ToString()")
+send_input(session_id="...", text="test")
+close_session(session_id="...")
+```
+
+Verify session creation succeeds without disabling certificate validation, both commands return expected output, `send_input` returns `unsupported_operation`, and the session closes successfully. Never record the password in the command, logs, or test evidence.
 
 ## Sudo Cache Warming Flow
 

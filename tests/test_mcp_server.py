@@ -354,6 +354,33 @@ def test_create_winrm_session_missing_credential_returns_structured_error():
     assert result["error"]["code"] == "missing_credential"
 
 
+@pytest.mark.parametrize(
+    "username",
+    [
+        "administrator@ad.byu.edu",
+        "BYU\\administrator@ad.byu.edu",
+        "\\administrator",
+        "BYU\\",
+        "BYU\\   ",
+        "   \\administrator",
+        "BYU\\extra\\administrator",
+    ],
+)
+def test_create_winrm_session_rejects_invalid_username_before_credential_lookup(username):
+    class LookupMustNotRunStore(FakeStore):
+        def get_record(self, slug, record_type):
+            raise AssertionError("credential lookup must not run for an invalid username")
+
+    result = mcp_server._create_winrm_session_impl(
+        "example.com",
+        username,
+        store=cast(CredentialStore, LookupMustNotRunStore()),
+    )
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "invalid_username"
+
+
 
 def test_create_winrm_session_decryption_failure_returns_structured_error():
     store = FakeStore(records={})
@@ -697,3 +724,10 @@ def test_create_server_uses_bifrost_name_and_does_not_import_legacy_app_package(
     assert type(server).__name__ == "FastMCP"
     assert getattr(server, "name", None) == "bifrost"
     assert legacy_module not in sys.modules
+
+
+def test_server_exposes_only_generic_close_session_tool():
+    tool_names = {tool.name for tool in mcp_server.create_server()._tool_manager.list_tools()}
+
+    assert "close_session" in tool_names
+    assert "close_ssh_session" not in tool_names
