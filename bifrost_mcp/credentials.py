@@ -58,6 +58,18 @@ class StoredSSHAuth:
 
 
 @dataclass(frozen=True)
+class DefaultCredential:
+    """Non-secret metadata for the single cross-transport fallback account."""
+
+    username: str
+    has_password: bool = False
+    has_ssh_key: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {"username": self.username, "has_password": self.has_password, "has_ssh_key": self.has_ssh_key}
+
+
+@dataclass(frozen=True)
 class CredentialMetadata:
     slug: str
     purpose: CredentialPurpose
@@ -173,7 +185,11 @@ class CredentialStore:
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "gopass show failed").strip()
             lowered = message.lower()
-            if "could not find password" in lowered or lowered == "not found":
+            if (
+                "could not find password" in lowered
+                or lowered == "not found"
+                or "entry is not in the password store" in lowered
+            ):
                 raise CredentialNotFound(f"No {record_type} credential record exists for {slug}")
             raise CredentialDecryptionFailed(
                 f"Failed to decrypt {record_type} credential record for {slug}. Unlock gopass/GPG and retry."
@@ -207,6 +223,69 @@ class CredentialStore:
         if parsed.purpose != "sudo":
             raise CredentialValidationError("sudo password resolution requires a sudo:// credential slug")
         return self.get_record(slug, "password").secret
+
+    def get_default_credential(self) -> DefaultCredential:
+        if not self._default_index_path.exists():
+            raise CredentialNotFound("No default credential is configured. Run 'bifrost-mcp credential set-default'.")
+        with self._default_index_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        username = data.get("username")
+        if not isinstance(username, str) or not username.strip():
+            raise CredentialValidationError("Default credential metadata has a missing or blank username")
+        return DefaultCredential(username=username.strip(), has_password=bool(data.get("has_password")), has_ssh_key=bool(data.get("has_ssh_key")))
+
+    def set_default_credential(self, username: str, *, password: str | None = None, ssh_key: str | None = None) -> DefaultCredential:
+        """Update the shared fallback account; ``None`` preserves an existing optional secret."""
+        user = username.strip() if isinstance(username, str) else ""
+        if not user:
+            raise CredentialValidationError("default credential username must not be blank")
+        try:
+            current = self.get_default_credential()
+        except CredentialNotFound:
+            current = DefaultCredential(username=user)
+        if password is not None:
+            self._store_default_record("password", password)
+        if ssh_key is not None:
+            self._store_default_record("key", ssh_key)
+        metadata = DefaultCredential(user, current.has_password or password is not None, current.has_ssh_key or ssh_key is not None)
+        self._save_default_credential(metadata)
+        return metadata
+
+    def resolve_default_ssh_auth(self) -> StoredSSHAuth:
+        metadata = self.get_default_credential()
+        if metadata.has_ssh_key:
+            return StoredSSHAuth(auth_type="key", secret=self._get_default_record("key"))
+        if metadata.has_password:
+            return StoredSSHAuth(auth_type="password", secret=self._get_default_record("password"))
+        raise CredentialNotFound("Default credential has neither an SSH key nor password")
+
+    def resolve_default_winrm_password(self) -> str:
+        if not self.get_default_credential().has_password:
+            raise CredentialNotFound("Default credential has no password for WinRM")
+        return self._get_default_record("password")
+
+    def unlock_default_credential(self, record_type: CredentialRecordType | None = None) -> dict[str, str]:
+        metadata = self.get_default_credential()
+        selected = record_type or ("key" if metadata.has_ssh_key else "password")
+        if selected == "key" and not metadata.has_ssh_key:
+            raise CredentialNotFound("Default credential has no SSH key")
+        if selected == "password" and not metadata.has_password:
+            raise CredentialNotFound("Default credential has no password")
+        self._get_default_record(selected)
+        return {"status": "unlocked", "credential": "default", "record_type": selected}
+
+    def attach_default_credential(self, purpose: Literal["ssh", "winrm"], username: str, canonical_host: str) -> CredentialMetadata:
+        """Materialize defaults only after a successful connection; never overwrite host-specific records."""
+        default = self.get_default_credential()
+        if username != default.username:
+            raise CredentialValidationError("default credential username does not match the requested connection username")
+        slug = build_slug(purpose, username, canonical_host)
+        record_types: tuple[CredentialRecordType, ...] = ("password",) if purpose == "winrm" else ("password", "key")
+        for record_type in record_types:
+            available = default.has_password if record_type == "password" else default.has_ssh_key
+            if available and not self.record_exists(slug, record_type):
+                self.store_record(slug, record_type, self._get_default_record(record_type))
+        return self.show_metadata(slug)
 
     def unlock_record(self, slug: str, record_type: CredentialRecordType | None = None) -> dict[str, str]:
         """Decrypt one record to warm gpg-agent without returning secret material."""
@@ -285,6 +364,39 @@ class CredentialStore:
     def _record_path(self, slug: str, record_type: CredentialRecordType) -> str:
         encoded = base64.urlsafe_b64encode(slug.encode("utf-8")).decode("ascii").rstrip("=")
         return f"bifrost_mcp/{encoded}/{record_type}"
+
+    @property
+    def _default_index_path(self) -> Path:
+        return self._index_path.with_name("default_credential.json")
+
+    @staticmethod
+    def _default_record_path(record_type: CredentialRecordType) -> str:
+        return f"bifrost_mcp/default/{record_type}"
+
+    def _store_default_record(self, record_type: CredentialRecordType, secret: str) -> None:
+        if not isinstance(secret, str) or not secret:
+            raise CredentialValidationError("default credential secret must not be blank")
+        record_path = self._default_record_path(record_type)
+        self._ensure_record_parent(record_path)
+        self._run(["gopass", "insert", "-f", "-m", record_path], input_text=json.dumps({"type": record_type, "secret": secret}), check=True)
+
+    def _get_default_record(self, record_type: CredentialRecordType) -> str:
+        result = self._run(["gopass", "show", self._default_record_path(record_type)], input_text=None, check=False)
+        if result.returncode != 0:
+            raise CredentialDecryptionFailed(f"Failed to decrypt default {record_type} credential record. Unlock gopass/GPG and retry.")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise CredentialValidationError(f"Stored default {record_type} credential record is not valid JSON") from exc
+        secret = data.get("secret")
+        if data.get("type") != record_type or not isinstance(secret, str) or not secret:
+            raise CredentialValidationError(f"Stored default {record_type} credential record is invalid")
+        return secret
+
+    def _save_default_credential(self, metadata: DefaultCredential) -> None:
+        self._default_index_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._default_index_path.open("w", encoding="utf-8") as handle:
+            json.dump({"username": metadata.username, "has_password": metadata.has_password, "has_ssh_key": metadata.has_ssh_key}, handle, indent=2, sort_keys=True)
 
     def _ensure_record_parent(self, record_path: str) -> None:
         password_store_dir = self._resolved_password_store_dir()

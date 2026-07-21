@@ -5,6 +5,7 @@ import pytest
 
 from bifrost_mcp.credentials import (
     CredentialDecryptionFailed,
+    DefaultCredential,
     CredentialNotFound,
     CredentialRecordExists,
     CredentialStore,
@@ -118,6 +119,21 @@ def test_get_record_surfaces_decryption_failures_separately(tmp_path):
         store.get_record("ssh://user@example.com", "password")
 
 
+def test_get_record_treats_gopass_missing_entry_error_as_not_found(tmp_path):
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+    path = store._record_path("ssh://user@example.com", "password")
+    runner.records[path] = subprocess.CompletedProcess(
+        ["gopass", "show", path],
+        11,
+        "",
+        'Error: failed to retrieve secret "bifrost_mcp/example/password": entry is not in the password store',
+    )
+
+    with pytest.raises(CredentialNotFound, match="No password credential record exists"):
+        store.get_record("ssh://user@example.com", "password")
+
+
 def test_malformed_records_fail_clearly(tmp_path):
     runner = FakeRunner()
     store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
@@ -143,6 +159,42 @@ def test_resolve_ssh_auth_prefers_key_and_falls_back_to_password(tmp_path):
 
     assert auth.auth_type == "key"
     assert auth.secret == "key-secret"
+
+
+def test_default_credential_resolves_for_ssh_and_winrm_without_a_host(tmp_path):
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+
+    saved = store.set_default_credential("EXAMPLE\\admin", password="password-secret", ssh_key="key-secret")
+
+    assert saved == DefaultCredential(username="EXAMPLE\\admin", has_password=True, has_ssh_key=True)
+    assert store.get_default_credential() == saved
+    assert store.resolve_default_ssh_auth().auth_type == "key"
+    assert store.resolve_default_winrm_password() == "password-secret"
+
+
+def test_default_credential_can_be_materialized_once_for_a_successful_host_connection(tmp_path):
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+    store.set_default_credential("user", password="password-secret", ssh_key=None)
+
+    attached = store.attach_default_credential("ssh", "user", "example.com")
+
+    assert attached.slug == "ssh://user@example.com"
+    assert attached.has_password is True
+    assert store.resolve_ssh_auth("ssh://user@example.com").secret == "password-secret"
+    assert store.attach_default_credential("ssh", "user", "example.com") == attached
+
+
+def test_unlock_default_credential_prefers_key_without_returning_secret(tmp_path):
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+    store.set_default_credential("user", password="password-secret", ssh_key="key-secret")
+
+    result = store.unlock_default_credential()
+
+    assert result == {"status": "unlocked", "credential": "default", "record_type": "key"}
+    assert "secret" not in str(result)
 
 
 def test_sudo_rejects_key_and_requires_password(tmp_path):

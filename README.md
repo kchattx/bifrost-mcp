@@ -226,6 +226,16 @@ Bifrost MCP requires `gopass` for SSH and sudo secrets. Secrets are managed out-
 
 Bifrost stores secret records in `gopass` under `bifrost_mcp/...`; the credential slug remains the stable user-facing identifier. Bifrost keeps only non-secret metadata in `~/.config/bifrost_mcp/credentials.json` so list/show commands do not need to read every secret.
 
+### Default account
+
+Configure one optional default account for every currently available transport:
+
+```bash
+bifrost-mcp credential set-default
+```
+
+The interactive prompt accepts a username, shared password, and SSH private key. Press Enter to leave an unset field blank; when updating an existing default, Enter preserves its current username/password/key. `credential list` always displays the configured default account separately from host-attached credential rows (and emits its non-secret metadata as `default_credential` with `--json`). `create_ssh_session` and `create_winrm_session` may omit `username` to use the default. If a connection using that fallback succeeds, Bifrost materializes the applicable default record as an attached per-host credential without overwriting an existing host-specific record.
+
 ### GPG unlock model
 
 Bifrost intentionally does not accept raw passwords or private keys from agent-facing MCP tools. The MCP server resolves secrets server-side through `gopass`, which in turn relies on GPG. For interactive desktops and developer machines, the recommended security model is:
@@ -240,7 +250,7 @@ Bifrost intentionally does not accept raw passwords or private keys from agent-f
 
 3. Let `gpg-agent` cache the unlock for a bounded time. You usually unlock once per cache window, not before every MCP tool call. After the TTL expires or after reboot, run `bifrost-mcp credential unlock` again.
 
-The credential unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. Credentials encrypted to the same GPG key should then work until the cache expires. With no filters, `bifrost-mcp credential unlock` auto-selects one deterministic stored credential. Use filters only if you need to target a specific credential:
+The credential unlock command decrypts one existing Bifrost credential only to warm the agent; it does not print secret values. When configured, no-argument `bifrost-mcp credential unlock` unlocks the default account first; otherwise it auto-selects one deterministic host-bound credential. Credentials encrypted to the same GPG key should then work until the cache expires. Use filters only if you need to target a specific credential:
 
 ```bash
 bifrost-mcp credential unlock --host example-host --user admin

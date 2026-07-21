@@ -15,6 +15,7 @@ from bifrost_mcp.credentials import (
     CredentialDecryptionFailed,
     CredentialError,
     CredentialNotFound,
+    CredentialRecord,
     CredentialRecordExists,
     CredentialRecordType,
     CredentialPurpose,
@@ -112,14 +113,34 @@ def _validate_auth_inputs(
         raise ValueError("raw SSH auth inputs are not accepted by agent-facing tools: " + ", ".join(supplied_legacy))
 
 
-def _create_ssh_session_impl(host: str, username: str, port: int = 22, *, store: CredentialStore | None = None) -> dict[str, Any]:
+def _create_ssh_session_impl(host: str, username: str | None = None, port: int = 22, *, store: CredentialStore | None = None) -> dict[str, Any]:
+    store = store or CredentialStore()
+    used_default = False
+    if username is None or not username.strip():
+        try:
+            username = store.get_default_credential().username
+            used_default = True
+        except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
     _validate_create_session_inputs(host, username, port)
     canonical_host = canonicalize_host(host, port)
     slug = build_slug("ssh", username, canonical_host)
-    store = store or CredentialStore()
     try:
         auth = _resolve_after_unlock_retry(store, slug, lambda: store.resolve_ssh_auth(slug))
-    except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+    except CredentialNotFound:
+        try:
+            default = store.get_default_credential()
+            if default.username != username:
+                raise CredentialNotFound(f"No stored SSH credential exists for {username}@{canonical_host}")
+            auth = store.resolve_default_ssh_auth()
+            used_default = True
+        except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
+    except CredentialDecryptionFailed as exc:
         return _missing_credential_error(exc)
     except CredentialError as exc:
         return _credential_error(exc)
@@ -128,6 +149,8 @@ def _create_ssh_session_impl(host: str, username: str, port: int = 22, *, store:
         handler = _open_ssh_handler(host, username, port, auth)
     except Exception as exc:
         return _error("ssh_connection_failed", str(exc))
+    if used_default:
+        store.attach_default_credential("ssh", username, canonical_host)
     _registry.register(handler)
     return {"status": "created", "session_id": handler.session_id, "transport": handler.transport, "host": canonical_host, "username": username, "port": port}
 
@@ -139,13 +162,23 @@ def _canonicalize_winrm_host(host: str, port: int, *, use_ssl: bool) -> str:
 
 def _create_winrm_session_impl(
     host: str,
-    username: str,
+    username: str | None = None,
     port: int = 5985,
     *,
     use_ssl: bool = False,
     auth: str = "ntlm",
     store: CredentialStore | None = None,
 ) -> dict[str, Any]:
+    store = store or CredentialStore()
+    used_default = False
+    if username is None or not username.strip():
+        try:
+            username = store.get_default_credential().username
+            used_default = True
+        except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
     _validate_create_session_inputs(host, username, port)
     domain, separator, account = username.partition("\\")
     if (
@@ -160,7 +193,6 @@ def _create_winrm_session_impl(
         return _error("invalid_auth", "WinRM auth must be 'ntlm' or 'basic'.")
     canonical_host = _canonicalize_winrm_host(host, port, use_ssl=use_ssl)
     slug = build_slug("winrm", username, canonical_host)
-    store = store or CredentialStore()
     try:
         record = _resolve_after_unlock_retry(
             store,
@@ -168,7 +200,18 @@ def _create_winrm_session_impl(
             lambda: store.get_record(slug, "password"),
             unlock_record_type="password",
         )
-    except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+    except CredentialNotFound:
+        try:
+            default = store.get_default_credential()
+            if default.username != username:
+                raise CredentialNotFound(f"No stored WinRM credential exists for {username}@{canonical_host}")
+            record = CredentialRecord(slug=slug, record_type="password", secret=store.resolve_default_winrm_password())
+            used_default = True
+        except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
+    except CredentialDecryptionFailed as exc:
         return _missing_credential_error(exc)
     except CredentialError as exc:
         return _credential_error(exc)
@@ -177,6 +220,8 @@ def _create_winrm_session_impl(
         handler = _open_winrm_handler(host, username, port, record.secret, use_ssl=use_ssl, auth=auth)
     except Exception as exc:
         return _error("winrm_connection_failed", str(exc))
+    if used_default:
+        store.attach_default_credential("winrm", username, canonical_host)
     _registry.register(handler)
     return {"status": "created", "session_id": handler.session_id, "transport": handler.transport, "host": canonical_host, "username": username, "port": port}
 
@@ -354,11 +399,11 @@ def create_server() -> FastMCP:
         return _list_credentials_impl(host)
 
     @server.tool(description="Open a new interactive SSH session using server-side stored credentials.")
-    def create_ssh_session(host: str, username: str, port: int = 22) -> dict[str, Any]:
+    def create_ssh_session(host: str, username: str | None = None, port: int = 22) -> dict[str, Any]:
         return _create_ssh_session_impl(host, username, port)
 
     @server.tool(description="Open a new WinRM session using server-side stored credentials.")
-    def create_winrm_session(host: str, username: str, port: int = 5985, use_ssl: bool = False, auth: str = "ntlm") -> dict[str, Any]:
+    def create_winrm_session(host: str, username: str | None = None, port: int = 5985, use_ssl: bool = False, auth: str = "ntlm") -> dict[str, Any]:
         return _create_winrm_session_impl(host, username, port, use_ssl=use_ssl, auth=auth)
 
     @server.tool(description="Send raw text to an active SSH session.")
@@ -438,6 +483,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_group.add_argument("--password", action="store_true", help="Read password secret from stdin (default).")
     add_group.add_argument("--key", help="Read private-key secret from this MCP-server-local file path.")
 
+    credential_sub.add_parser("set-default", help="Interactively configure the single cross-transport default account.")
+
     list_cmd = credential_sub.add_parser("list", help="List non-secret credential metadata.")
     list_cmd.add_argument("--host")
     list_cmd.add_argument("--user")
@@ -477,9 +524,30 @@ def _read_optional_sudo_password_for_ssh_slug() -> str:
     return getpass.getpass("Sudo Password (Leave blank for none): ")
 
 
-def _format_credential_list(rows: list[Any]) -> str:
-    if not rows:
+def _prompt_default_credential(store: CredentialStore):
+    try:
+        current = store.get_default_credential()
+    except CredentialNotFound:
+        current = None
+    username_prompt = f"Username [{current.username}]: " if current else "Username: "
+    username = input(username_prompt).strip() or (current.username if current else "")
+    password = getpass.getpass("Password [unchanged]: " if current and current.has_password else "Password (Leave blank for none): ")
+    ssh_key = getpass.getpass("SSH key [unchanged]: " if current and current.has_ssh_key else "SSH key (Leave blank for none): ")
+    return username, password or None, ssh_key or None
+
+
+def _format_credential_list(rows: list[Any], default_credential: Any | None = None) -> str:
+    if not rows and default_credential is None:
         return "No Bifrost credentials found."
+
+    default_summary = ""
+    if default_credential is not None:
+        records = []
+        if default_credential.has_password:
+            records.append("password")
+        if default_credential.has_ssh_key:
+            records.append("key")
+        default_summary = f"Default credential: {default_credential.username} ({','.join(records) or '-'})"
 
     table_rows = []
     for row in rows:
@@ -498,6 +566,9 @@ def _format_credential_list(rows: list[Any]) -> str:
             }
         )
 
+    if not table_rows:
+        return "\n".join(["Bifrost credentials:", default_summary])
+
     headers = {
         "purpose": "Purpose",
         "host": "Host",
@@ -513,7 +584,7 @@ def _format_credential_list(rows: list[Any]) -> str:
     header = "  ".join(headers[column].ljust(widths[column]) for column in columns)
     separator = "  ".join("-" * widths[column] for column in columns)
     body = ["  ".join(str(row[column]).ljust(widths[column]) for column in columns) for row in table_rows]
-    return "\n".join(["Bifrost credentials:", header, separator, *body])
+    return "\n".join(["Bifrost credentials:", default_summary, header, separator, *body])
 
 
 def _select_unlock_target(
@@ -562,6 +633,13 @@ def _select_unlock_target(
 def _handle_credential_cli(args: argparse.Namespace, *, store: CredentialStore | None = None) -> int:
     store = store or CredentialStore()
     try:
+        if args.credential_command == "set-default":
+            if not getattr(sys.stdin, "isatty", lambda: False)():
+                raise CredentialValidationError("credential set-default requires an interactive terminal")
+            username, password, ssh_key = _prompt_default_credential(store)
+            metadata = store.set_default_credential(username, password=password, ssh_key=ssh_key)
+            print(json.dumps({"status": "stored", "default_credential": {"username": metadata.username, "has_password": metadata.has_password, "has_ssh_key": metadata.has_ssh_key}}, sort_keys=True))
+            return 0
         if args.credential_command == "add":
             slug = args.slug.strip()
             parsed = parse_slug(slug)
@@ -584,10 +662,14 @@ def _handle_credential_cli(args: argparse.Namespace, *, store: CredentialStore |
             return 0
         if args.credential_command == "list":
             rows = store.list_metadata(host=args.host, user=args.user, purpose=args.purpose)
+            try:
+                default_credential = store.get_default_credential()
+            except CredentialNotFound:
+                default_credential = None
             if args.json:
-                print(json.dumps({"status": "ok", "credentials": [row.to_dict() for row in rows]}, sort_keys=True))
+                print(json.dumps({"status": "ok", "credentials": [row.to_dict() for row in rows], "default_credential": default_credential.to_dict() if default_credential else None}, sort_keys=True))
             else:
-                print(_format_credential_list(rows))
+                print(_format_credential_list(rows, default_credential))
             return 0
         if args.credential_command == "show":
             slug = args.slug.strip()
@@ -602,6 +684,14 @@ def _handle_credential_cli(args: argparse.Namespace, *, store: CredentialStore |
         if args.credential_command == "unlock":
             record_type = "key" if args.key else "password" if args.password else None
             slug_arg = args.slug.strip() if args.slug else None
+            if not slug_arg and not args.host and not args.user and not args.purpose:
+                try:
+                    result = store.unlock_default_credential(record_type)
+                except CredentialNotFound:
+                    pass
+                else:
+                    print(json.dumps(result, sort_keys=True))
+                    return 0
             slug, record_type = _select_unlock_target(
                 store,
                 slug=slug_arg,

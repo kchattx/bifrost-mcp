@@ -1,3 +1,4 @@
+import builtins
 import io
 import json
 import subprocess
@@ -9,7 +10,7 @@ from typing import cast
 import pytest
 
 import bifrost_mcp.mcp_server as mcp_server
-from bifrost_mcp.credentials import CredentialDecryptionFailed, CredentialMetadata, CredentialNotFound, CredentialRecord, CredentialStore, StoredSSHAuth
+from bifrost_mcp.credentials import CredentialDecryptionFailed, CredentialMetadata, CredentialNotFound, CredentialRecord, CredentialStore, DefaultCredential, StoredSSHAuth
 from bifrost_mcp.session import RemoteSessionHandler
 
 
@@ -94,6 +95,12 @@ class FakeStore:
             raise self.sudo_exc
         self.sudo_slug = slug
         return self.sudo_password
+
+    def get_default_credential(self) -> DefaultCredential:
+        raise CredentialNotFound("No default credential is configured")
+
+    def unlock_default_credential(self, record_type=None) -> dict[str, str]:
+        raise CredentialNotFound("No default credential is configured")
 
     def get_record(self, slug, record_type):
         self.record_slug = slug
@@ -252,6 +259,40 @@ def test_create_ssh_session_missing_credential_returns_structured_error():
     assert result["status"] == "error"
     assert result["error"]["code"] == "missing_credential"
 
+
+
+def test_create_ssh_session_falls_back_to_default_and_attaches_it_only_after_connecting(monkeypatch):
+    class FakeSSHHandler:
+        transport = "ssh"
+
+        def open_session(self, **kwargs):
+            self.session_id = "sid"
+            self.host = kwargs["host"]
+            self.canonical_host = "example.com"
+            self.username = kwargs["username"]
+            self.port = kwargs["port"]
+            self.created_at = time.monotonic()
+            self.last_activity_at = self.created_at
+            return "sid"
+
+    class DefaultStore(FakeStore):
+        def get_default_credential(self):
+            return DefaultCredential(username="user", has_password=True)
+
+        def resolve_default_ssh_auth(self):
+            return StoredSSHAuth(auth_type="password", secret="default-secret")
+
+        def attach_default_credential(self, purpose, username, canonical_host):
+            self.attached = (purpose, username, canonical_host)
+
+    monkeypatch.setattr(mcp_server, "SSHHandler", FakeSSHHandler)
+    store = DefaultStore()
+
+    result = mcp_server._create_ssh_session_impl("Example.COM", None, store=cast(CredentialStore, store))
+
+    assert result["status"] == "created"
+    assert result["username"] == "user"
+    assert store.attached == ("ssh", "user", "example.com")
 
 
 def test_create_ssh_session_decryption_failure_returns_structured_error():
@@ -513,6 +554,33 @@ def test_warm_sudo_cache_retries_once_after_unlock(monkeypatch):
     assert store.calls == 2
 
 
+def test_credential_cli_set_default_prompts_and_preserves_blank_existing_secrets(monkeypatch, capsys):
+    class TTYStdin:
+        def isatty(self):
+            return True
+
+    class DefaultStore(FakeStore):
+        def get_default_credential(self):
+            return DefaultCredential(username="old-user", has_password=True, has_ssh_key=True)
+
+        def set_default_credential(self, username, *, password=None, ssh_key=None):
+            self.default_update = (username, password, ssh_key)
+            return DefaultCredential(username=username, has_password=True, has_ssh_key=True)
+
+    prompts = []
+    answers = iter(["new-user", "", ""])
+    args = mcp_server._build_parser().parse_args(["credential", "set-default"])
+    store = DefaultStore()
+    monkeypatch.setattr(sys, "stdin", TTYStdin())
+    monkeypatch.setattr(builtins, "input", lambda prompt: prompts.append(prompt) or next(answers))
+    monkeypatch.setattr(mcp_server.getpass, "getpass", lambda prompt: prompts.append(prompt) or next(answers))
+
+    assert mcp_server._handle_credential_cli(args, store=cast(CredentialStore, store)) == 0
+    assert store.default_update == ("new-user", None, None)
+    assert prompts == ["Username [old-user]: ", "Password [unchanged]: ", "SSH key [unchanged]: "]
+    assert "new-user" in capsys.readouterr().out
+
+
 def test_credential_cli_add_password_reads_piped_stdin(monkeypatch, capsys):
     args = mcp_server._build_parser().parse_args(["credential", "add", "  ssh://user@example.com  "])
     store = FakeStore()
@@ -650,6 +718,30 @@ def test_credential_cli_list_json_preserves_machine_readable_output(capsys):
     assert payload["credentials"][0]["slug"] == "ssh://deploy@example.com"
 
 
+def test_credential_cli_list_includes_default_credential_metadata(capsys):
+    class DefaultStore(FakeStore):
+        def get_default_credential(self):
+            return DefaultCredential(username="admin", has_password=True, has_ssh_key=True)
+
+    args = mcp_server._build_parser().parse_args(["credential", "list", "--json"])
+
+    assert mcp_server._handle_credential_cli(args, store=cast(CredentialStore, DefaultStore())) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["default_credential"] == {"username": "admin", "has_password": True, "has_ssh_key": True}
+
+
+def test_credential_cli_list_table_displays_default_credential(capsys):
+    class DefaultStore(FakeStore):
+        def get_default_credential(self):
+            return DefaultCredential(username="admin", has_password=True, has_ssh_key=True)
+
+    args = mcp_server._build_parser().parse_args(["credential", "list"])
+
+    assert mcp_server._handle_credential_cli(args, store=cast(CredentialStore, DefaultStore())) == 0
+    assert "Default credential: admin (password,key)" in capsys.readouterr().out
+
+
 
 def test_credential_cli_show_and_remove_strip_slug(capsys):
     show_args = mcp_server._build_parser().parse_args(["credential", "show", "  ssh://user@example.com  "])
@@ -704,6 +796,20 @@ def test_credential_cli_unlock_auto_selects_deterministic_record(capsys):
     assert store.unlocked == ("ssh://deploy@example.com", "password")
     payload = json.loads(capsys.readouterr().out)
     assert payload["slug"] == "ssh://deploy@example.com"
+
+
+def test_credential_cli_unlock_prefers_configured_default(capsys):
+    class DefaultStore(FakeStore):
+        def unlock_default_credential(self, record_type=None):
+            self.default_unlocked = record_type
+            return {"status": "unlocked", "credential": "default", "record_type": record_type or "key"}
+
+    args = mcp_server._build_parser().parse_args(["credential", "unlock"])
+    store = DefaultStore()
+
+    assert mcp_server._handle_credential_cli(args, store=cast(CredentialStore, store)) == 0
+    assert store.default_unlocked is None
+    assert json.loads(capsys.readouterr().out)["credential"] == "default"
 
 
 def test_credential_parser_accepts_winrm_purpose():
