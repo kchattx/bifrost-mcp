@@ -234,7 +234,7 @@ Configure one optional default account for every currently available transport:
 bifrost-mcp credential set-default
 ```
 
-The interactive prompt accepts a username, shared password, and SSH private key. Press Enter to leave an unset field blank; when updating an existing default, Enter preserves its current username/password/key. `credential list` always displays the configured default account separately from host-attached credential rows (and emits its non-secret metadata as `default_credential` with `--json`). `create_ssh_session` and `create_winrm_session` may omit `username` to use the default. If a connection using that fallback succeeds, Bifrost materializes the applicable default record as an attached per-host credential without overwriting an existing host-specific record.
+The interactive prompt accepts a username, shared password, and SSH private key. Press Enter to leave an unset field blank; when updating an existing default, Enter preserves its current username/password/key. `credential list` always displays the configured default account separately from host-attached credential rows (and emits its non-secret metadata as `default_credential` with `--json`). `create_ssh_session` and `create_winrm_session` may omit `username` to use the default. Agents can explicitly force use of the default with `use_default_credential=True` on either session-creation tool or `warm_sudo_cache`; this bypasses any host-specific credential and requires an explicitly supplied username to match the configured default username. Without that flag, `warm_sudo_cache` uses the default password only when no host-specific `sudo://...` record exists and the SSH session username exactly matches the default username. If an SSH or WinRM connection using the default succeeds, Bifrost materializes the applicable default record as an attached per-host credential without overwriting an existing host-specific record.
 
 ### GPG unlock model
 
@@ -345,15 +345,15 @@ bifrost-mcp credential remove ssh://admin@example-host --password
 ## Available MCP Tools
 
 - `list_credentials(host)`: lists non-secret user metadata for one host, grouped by username.
-- `create_ssh_session(host, username, port=22)`: opens a new interactive SSH session using stored `ssh://...` credentials.
-- `create_winrm_session(host, username, port=5985, use_ssl=False, auth="ntlm")`: opens a WinRM session using stored `winrm://...` password credentials.
+- `create_ssh_session(host, username, port=22, use_default_credential=False)`: opens a new interactive SSH session using stored `ssh://...` credentials. Set `use_default_credential=True` to force the configured default account.
+- `create_winrm_session(host, username, port=5985, use_ssl=False, auth="ntlm", use_default_credential=False)`: opens a WinRM session using stored `winrm://...` password credentials. Set `use_default_credential=True` to force the configured default account.
 - `send_input(session_id, text)`: sends raw text to an existing session.
 - `send_control(session_id, key)`: sends one of `ctrl-c`, `ctrl-d`, `ctrl-z`, `enter`, or `escape`.
 - `read_output(session_id, clear_buffer=True)`: reads buffered output from a session.
 - `wait_for_output(session_id, pattern, timeout, regex=True, clear_buffer=True)`: waits until buffered output matches a regex or literal.
 - `run_command(session_id, command, timeout=30)`: runs a command inside the existing transport. For SSH it uses the interactive shell and waits for a sentinel. For WinRM it executes PowerShell script text via pywinrm `run_ps()` and returns stdout/stderr/exit code.
 - `check_sudo_cache(session_id, timeout=10)`: runs `sudo -n -v` to check whether sudo is already warm.
-- `warm_sudo_cache(session_id, timeout=10)`: derives `sudo://<session-user>@<session-host>`, sends the password server-side, and warms sudo with `sudo -S ... -v`.
+- `warm_sudo_cache(session_id, timeout=10, use_default_credential=False)`: derives `sudo://<session-user>@<session-host>`, sends the password server-side, and warms sudo with `sudo -S ... -v`. Set `use_default_credential=True` to force the matching configured default password.
 - `clear_sudo_cache(session_id, timeout=10)`: invalidates sudo timestamp state with `sudo -k`.
 - `upload_file(session_id, local_path, remote_path, create_parents=False)`: uploads one MCP-server-local file over SFTP without overwriting.
 - `download_file(session_id, remote_path, local_path, create_parents=False)`: downloads one remote file to an MCP-server-local destination file path without overwriting.
@@ -449,7 +449,7 @@ Verify session creation succeeds without disabling certificate validation, both 
 
 1. Optionally call `check_sudo_cache(session_id)`.
 2. If sudo needs a password, call `warm_sudo_cache(session_id)`.
-3. Bifrost MCP derives `sudo://<session-user>@<canonical-host>` internally, retrieves the password server-side, and runs:
+3. Bifrost MCP derives `sudo://<session-user>@<canonical-host>` internally and retrieves that password server-side. If it is absent, Bifrost uses the configured default password only when the session username exactly matches the default username. It then runs:
 
 ```bash
 sudo -S -p '[bifrost-mcp sudo password] ' -v && printf '\n__BIFROST_MCP_SUDO_OK__\n' || printf '\n__BIFROST_MCP_SUDO_FAILED__\n'

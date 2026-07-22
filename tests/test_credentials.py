@@ -161,7 +161,7 @@ def test_resolve_ssh_auth_prefers_key_and_falls_back_to_password(tmp_path):
     assert auth.secret == "key-secret"
 
 
-def test_default_credential_resolves_for_ssh_and_winrm_without_a_host(tmp_path):
+def test_default_credential_resolves_for_ssh_winrm_and_sudo_without_a_host(tmp_path):
     runner = FakeRunner()
     store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
 
@@ -171,6 +171,7 @@ def test_default_credential_resolves_for_ssh_and_winrm_without_a_host(tmp_path):
     assert store.get_default_credential() == saved
     assert store.resolve_default_ssh_auth().auth_type == "key"
     assert store.resolve_default_winrm_password() == "password-secret"
+    assert store.resolve_default_sudo_password() == "password-secret"
 
 
 def test_default_credential_can_be_materialized_once_for_a_successful_host_connection(tmp_path):

@@ -113,12 +113,22 @@ def _validate_auth_inputs(
         raise ValueError("raw SSH auth inputs are not accepted by agent-facing tools: " + ", ".join(supplied_legacy))
 
 
-def _create_ssh_session_impl(host: str, username: str | None = None, port: int = 22, *, store: CredentialStore | None = None) -> dict[str, Any]:
+def _create_ssh_session_impl(
+    host: str,
+    username: str | None = None,
+    port: int = 22,
+    *,
+    use_default_credential: bool = False,
+    store: CredentialStore | None = None,
+) -> dict[str, Any]:
     store = store or CredentialStore()
     used_default = False
-    if username is None or not username.strip():
+    if use_default_credential or username is None or not username.strip():
         try:
-            username = store.get_default_credential().username
+            default_username = store.get_default_credential().username
+            if use_default_credential and username is not None and username.strip() and username != default_username:
+                return _error("invalid_default_credential", "Requested username does not match the configured default credential username.")
+            username = default_username
             used_default = True
         except (CredentialNotFound, CredentialDecryptionFailed) as exc:
             return _missing_credential_error(exc)
@@ -127,23 +137,32 @@ def _create_ssh_session_impl(host: str, username: str | None = None, port: int =
     _validate_create_session_inputs(host, username, port)
     canonical_host = canonicalize_host(host, port)
     slug = build_slug("ssh", username, canonical_host)
-    try:
-        auth = _resolve_after_unlock_retry(store, slug, lambda: store.resolve_ssh_auth(slug))
-    except CredentialNotFound:
+    if use_default_credential:
         try:
             default = store.get_default_credential()
-            if default.username != username:
-                raise CredentialNotFound(f"No stored SSH credential exists for {username}@{canonical_host}")
             auth = store.resolve_default_ssh_auth()
-            used_default = True
         except (CredentialNotFound, CredentialDecryptionFailed) as exc:
             return _missing_credential_error(exc)
         except CredentialError as exc:
             return _credential_error(exc)
-    except CredentialDecryptionFailed as exc:
-        return _missing_credential_error(exc)
-    except CredentialError as exc:
-        return _credential_error(exc)
+    else:
+        try:
+            auth = _resolve_after_unlock_retry(store, slug, lambda: store.resolve_ssh_auth(slug))
+        except CredentialNotFound:
+            try:
+                default = store.get_default_credential()
+                if default.username != username:
+                    raise CredentialNotFound(f"No stored SSH credential exists for {username}@{canonical_host}")
+                auth = store.resolve_default_ssh_auth()
+                used_default = True
+            except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+                return _missing_credential_error(exc)
+            except CredentialError as exc:
+                return _credential_error(exc)
+        except CredentialDecryptionFailed as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
 
     try:
         handler = _open_ssh_handler(host, username, port, auth)
@@ -167,13 +186,17 @@ def _create_winrm_session_impl(
     *,
     use_ssl: bool = False,
     auth: str = "ntlm",
+    use_default_credential: bool = False,
     store: CredentialStore | None = None,
 ) -> dict[str, Any]:
     store = store or CredentialStore()
     used_default = False
-    if username is None or not username.strip():
+    if use_default_credential or username is None or not username.strip():
         try:
-            username = store.get_default_credential().username
+            default_username = store.get_default_credential().username
+            if use_default_credential and username is not None and username.strip() and username != default_username:
+                return _error("invalid_default_credential", "Requested username does not match the configured default credential username.")
+            username = default_username
             used_default = True
         except (CredentialNotFound, CredentialDecryptionFailed) as exc:
             return _missing_credential_error(exc)
@@ -193,28 +216,37 @@ def _create_winrm_session_impl(
         return _error("invalid_auth", "WinRM auth must be 'ntlm' or 'basic'.")
     canonical_host = _canonicalize_winrm_host(host, port, use_ssl=use_ssl)
     slug = build_slug("winrm", username, canonical_host)
-    try:
-        record = _resolve_after_unlock_retry(
-            store,
-            slug,
-            lambda: store.get_record(slug, "password"),
-            unlock_record_type="password",
-        )
-    except CredentialNotFound:
+    if use_default_credential:
         try:
             default = store.get_default_credential()
-            if default.username != username:
-                raise CredentialNotFound(f"No stored WinRM credential exists for {username}@{canonical_host}")
             record = CredentialRecord(slug=slug, record_type="password", secret=store.resolve_default_winrm_password())
-            used_default = True
         except (CredentialNotFound, CredentialDecryptionFailed) as exc:
             return _missing_credential_error(exc)
         except CredentialError as exc:
             return _credential_error(exc)
-    except CredentialDecryptionFailed as exc:
-        return _missing_credential_error(exc)
-    except CredentialError as exc:
-        return _credential_error(exc)
+    else:
+        try:
+            record = _resolve_after_unlock_retry(
+                store,
+                slug,
+                lambda: store.get_record(slug, "password"),
+                unlock_record_type="password",
+            )
+        except CredentialNotFound:
+            try:
+                default = store.get_default_credential()
+                if default.username != username:
+                    raise CredentialNotFound(f"No stored WinRM credential exists for {username}@{canonical_host}")
+                record = CredentialRecord(slug=slug, record_type="password", secret=store.resolve_default_winrm_password())
+                used_default = True
+            except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+                return _missing_credential_error(exc)
+            except CredentialError as exc:
+                return _credential_error(exc)
+        except CredentialDecryptionFailed as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
 
     try:
         handler = _open_winrm_handler(host, username, port, record.secret, use_ssl=use_ssl, auth=auth)
@@ -341,7 +373,7 @@ def _check_sudo_cache_impl(session_id: str, timeout: float = 10) -> dict[str, An
     return handler.check_sudo_cache(timeout=timeout)
 
 
-def _warm_sudo_cache_impl(session_id: str, timeout: float = 10) -> dict[str, Any]:
+def _warm_sudo_cache_impl(session_id: str, timeout: float = 10, use_default_credential: bool = False) -> dict[str, Any]:
     handler = _get_session(session_id)
     if handler.transport == "winrm":
         return _unsupported_operation("warm_sudo_cache", handler.transport)
@@ -349,17 +381,38 @@ def _warm_sudo_cache_impl(session_id: str, timeout: float = 10) -> dict[str, Any
         return _error("missing_session_metadata", "Session is missing username or canonical host metadata.")
     slug = build_slug("sudo", handler.username, handler.canonical_host)
     store = CredentialStore()
-    try:
-        password = _resolve_after_unlock_retry(
-            store,
-            slug,
-            lambda: store.resolve_sudo_password(slug),
-            unlock_record_type="password",
-        )
-    except (CredentialNotFound, CredentialDecryptionFailed) as exc:
-        return _missing_credential_error(exc)
-    except CredentialError as exc:
-        return _credential_error(exc)
+    if use_default_credential:
+        try:
+            default = store.get_default_credential()
+            if default.username != handler.username:
+                raise CredentialNotFound(f"No stored sudo credential exists for {handler.username}@{handler.canonical_host}")
+            password = store.resolve_default_sudo_password()
+        except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
+    else:
+        try:
+            password = _resolve_after_unlock_retry(
+                store,
+                slug,
+                lambda: store.resolve_sudo_password(slug),
+                unlock_record_type="password",
+            )
+        except CredentialNotFound:
+            try:
+                default = store.get_default_credential()
+                if default.username != handler.username:
+                    raise CredentialNotFound(f"No stored sudo credential exists for {handler.username}@{handler.canonical_host}")
+                password = store.resolve_default_sudo_password()
+            except (CredentialNotFound, CredentialDecryptionFailed) as exc:
+                return _missing_credential_error(exc)
+            except CredentialError as exc:
+                return _credential_error(exc)
+        except CredentialDecryptionFailed as exc:
+            return _missing_credential_error(exc)
+        except CredentialError as exc:
+            return _credential_error(exc)
     return handler.warm_sudo_cache(password, timeout=timeout)
 
 
@@ -398,13 +451,13 @@ def create_server() -> FastMCP:
     def list_credentials(host: str) -> dict[str, Any]:
         return _list_credentials_impl(host)
 
-    @server.tool(description="Open a new interactive SSH session using server-side stored credentials.")
-    def create_ssh_session(host: str, username: str | None = None, port: int = 22) -> dict[str, Any]:
-        return _create_ssh_session_impl(host, username, port)
+    @server.tool(description="Open a new interactive SSH session using server-side stored credentials. Set use_default_credential to force the configured default account.")
+    def create_ssh_session(host: str, username: str | None = None, port: int = 22, use_default_credential: bool = False) -> dict[str, Any]:
+        return _create_ssh_session_impl(host, username, port, use_default_credential=use_default_credential)
 
-    @server.tool(description="Open a new WinRM session using server-side stored credentials.")
-    def create_winrm_session(host: str, username: str | None = None, port: int = 5985, use_ssl: bool = False, auth: str = "ntlm") -> dict[str, Any]:
-        return _create_winrm_session_impl(host, username, port, use_ssl=use_ssl, auth=auth)
+    @server.tool(description="Open a new WinRM session using server-side stored credentials. Set use_default_credential to force the configured default account.")
+    def create_winrm_session(host: str, username: str | None = None, port: int = 5985, use_ssl: bool = False, auth: str = "ntlm", use_default_credential: bool = False) -> dict[str, Any]:
+        return _create_winrm_session_impl(host, username, port, use_ssl=use_ssl, auth=auth, use_default_credential=use_default_credential)
 
     @server.tool(description="Send raw text to an active SSH session.")
     def send_input(session_id: str, text: str) -> dict[str, str]:
@@ -434,9 +487,9 @@ def create_server() -> FastMCP:
     def check_sudo_cache(session_id: str, timeout: float = 10) -> dict[str, Any]:
         return _check_sudo_cache_impl(session_id, timeout=timeout)
 
-    @server.tool(description="Warm sudo credentials using server-managed gopass sudo password.")
-    def warm_sudo_cache(session_id: str, timeout: float = 10) -> dict[str, Any]:
-        return _warm_sudo_cache_impl(session_id, timeout=timeout)
+    @server.tool(description="Warm sudo credentials using a server-managed gopass password. Set use_default_credential to force the configured default account password.")
+    def warm_sudo_cache(session_id: str, timeout: float = 10, use_default_credential: bool = False) -> dict[str, Any]:
+        return _warm_sudo_cache_impl(session_id, timeout=timeout, use_default_credential=use_default_credential)
 
     @server.tool(description="Clear remote sudo timestamp cache with sudo -k.")
     def clear_sudo_cache(session_id: str, timeout: float = 10) -> dict[str, Any]:

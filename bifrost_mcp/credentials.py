@@ -264,6 +264,12 @@ class CredentialStore:
             raise CredentialNotFound("Default credential has no password for WinRM")
         return self._get_default_record("password")
 
+    def resolve_default_sudo_password(self) -> str:
+        """Return the default account password only for a same-user sudo fallback."""
+        if not self.get_default_credential().has_password:
+            raise CredentialNotFound("Default credential has no password for sudo")
+        return self._get_default_record("password")
+
     def unlock_default_credential(self, record_type: CredentialRecordType | None = None) -> dict[str, str]:
         metadata = self.get_default_credential()
         selected = record_type or ("key" if metadata.has_ssh_key else "password")

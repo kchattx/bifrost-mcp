@@ -295,6 +295,31 @@ def test_create_ssh_session_falls_back_to_default_and_attaches_it_only_after_con
     assert store.attached == ("ssh", "user", "example.com")
 
 
+def test_create_ssh_session_can_explicitly_use_default_credential(monkeypatch):
+    class DefaultStore(FakeStore):
+        def resolve_ssh_auth(self, slug):
+            raise AssertionError("host-specific SSH credentials must not be used when the default is requested")
+
+        def get_default_credential(self):
+            return DefaultCredential(username="user", has_password=True)
+
+        def resolve_default_ssh_auth(self):
+            return StoredSSHAuth(auth_type="password", secret="default-secret")
+
+        def attach_default_credential(self, purpose, username, canonical_host):
+            self.attached = (purpose, username, canonical_host)
+
+    opened = {}
+    monkeypatch.setattr(mcp_server, "_open_ssh_handler", lambda host, username, port, auth: opened.update(auth=auth) or FakeHandler("ssh-1"))
+    store = DefaultStore()
+
+    result = mcp_server._create_ssh_session_impl("example.com", "user", use_default_credential=True, store=cast(CredentialStore, store))
+
+    assert result["status"] == "created"
+    assert opened["auth"].secret == "default-secret"
+    assert store.attached == ("ssh", "user", "example.com")
+
+
 def test_create_ssh_session_decryption_failure_returns_structured_error():
     store = FakeStore()
     store.auth_exc = CredentialDecryptionFailed("unlock gpg")
@@ -393,6 +418,31 @@ def test_create_winrm_session_missing_credential_returns_structured_error():
 
     assert result["status"] == "error"
     assert result["error"]["code"] == "missing_credential"
+
+
+def test_create_winrm_session_can_explicitly_use_default_credential(monkeypatch):
+    class DefaultStore(FakeStore):
+        def get_record(self, slug, record_type):
+            raise AssertionError("host-specific WinRM credentials must not be used when the default is requested")
+
+        def get_default_credential(self):
+            return DefaultCredential(username="EXAMPLE\\user", has_password=True)
+
+        def resolve_default_winrm_password(self):
+            return "default-password"
+
+        def attach_default_credential(self, purpose, username, canonical_host):
+            self.attached = (purpose, username, canonical_host)
+
+    opened = {}
+    monkeypatch.setattr(mcp_server, "_open_winrm_handler", lambda host, username, port, password, **kwargs: opened.update(password=password) or FakeHandler("winrm-1"))
+    store = DefaultStore()
+
+    result = mcp_server._create_winrm_session_impl("example.com", "EXAMPLE\\user", use_default_credential=True, store=cast(CredentialStore, store))
+
+    assert result["status"] == "created"
+    assert opened["password"] == "default-password"
+    assert store.attached == ("winrm", "EXAMPLE\\user", "example.com")
 
 
 @pytest.mark.parametrize(
@@ -552,6 +602,55 @@ def test_warm_sudo_cache_retries_once_after_unlock(monkeypatch):
     assert result["status"] == "ok"
     assert store.unlocked == ("sudo://user@example.com", "password")
     assert store.calls == 2
+
+
+def test_warm_sudo_cache_uses_matching_default_password_when_host_record_is_missing(monkeypatch):
+    handler = FakeHandler("ssh-1")
+    mcp_server._sessions["ssh-1"] = cast(RemoteSessionHandler, handler)
+
+    class DefaultSudoStore:
+        def resolve_sudo_password(self, slug):
+            raise CredentialNotFound(f"No password credential record exists for {slug}")
+
+        def get_default_credential(self):
+            return DefaultCredential(username="user", has_password=True)
+
+        def resolve_default_sudo_password(self):
+            return "default-password"
+
+    store = DefaultSudoStore()
+    monkeypatch.setattr(mcp_server, "CredentialStore", lambda: store)
+    warmed = {}
+    monkeypatch.setattr(handler, "warm_sudo_cache", lambda password, timeout=10: warmed.update(password=password) or {"status": "warmed"})
+
+    result = mcp_server._warm_sudo_cache_impl("ssh-1")
+
+    assert result == {"status": "warmed"}
+    assert warmed == {"password": "default-password"}
+
+
+def test_warm_sudo_cache_can_explicitly_use_default_credential(monkeypatch):
+    handler = FakeHandler("ssh-1")
+    mcp_server._sessions["ssh-1"] = cast(RemoteSessionHandler, handler)
+
+    class DefaultSudoStore:
+        def resolve_sudo_password(self, slug):
+            raise AssertionError("host-specific sudo credentials must not be used when the default is requested")
+
+        def get_default_credential(self):
+            return DefaultCredential(username="user", has_password=True)
+
+        def resolve_default_sudo_password(self):
+            return "default-password"
+
+    monkeypatch.setattr(mcp_server, "CredentialStore", lambda: DefaultSudoStore())
+    warmed = {}
+    monkeypatch.setattr(handler, "warm_sudo_cache", lambda password, timeout=10: warmed.update(password=password) or {"status": "warmed"})
+
+    result = mcp_server._warm_sudo_cache_impl("ssh-1", use_default_credential=True)
+
+    assert result == {"status": "warmed"}
+    assert warmed == {"password": "default-password"}
 
 
 def test_credential_cli_set_default_prompts_and_preserves_blank_existing_secrets(monkeypatch, capsys):
