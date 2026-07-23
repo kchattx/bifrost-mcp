@@ -25,6 +25,8 @@ class FakeRunner:
         self.calls.append((list(args), input))
         command = args[1]
         path = args[-1]
+        if command == "ls":
+            return subprocess.CompletedProcess(args, 0, "\n".join(sorted(self.records)), "")
         if command == "show":
             if path not in self.records:
                 return subprocess.CompletedProcess(args, 1, "", "not found")
@@ -230,6 +232,26 @@ def test_metadata_filters_exclude_secrets(tmp_path):
     }
     assert "secret" not in json.dumps([row.to_dict() for row in store.list_metadata()])
 
+
+def test_list_metadata_discovers_existing_gopass_records_missing_from_index(tmp_path):
+    runner = FakeRunner()
+    store = CredentialStore(runner=runner, index_path=tmp_path / "credentials.json")
+    slug = "ssh://user@example.com"
+    runner.records[store._record_path(slug, "password")] = json.dumps({"type": "password", "secret": "secret"})
+
+    rows = store.list_metadata()
+
+    assert [row.to_dict() for row in rows] == [
+        {
+            "slug": slug,
+            "purpose": "ssh",
+            "username": "user",
+            "canonical_host": "example.com",
+            "has_password": True,
+            "has_key": False,
+        }
+    ]
+    assert json.loads((tmp_path / "credentials.json").read_text(encoding="utf-8"))[slug]["has_password"] is True
 
 
 def test_list_and_show_prune_stale_index_entries_when_backing_record_is_missing(tmp_path):

@@ -446,6 +446,11 @@ class CredentialStore:
 
     def _reconcile_index(self) -> dict[str, CredentialMetadata]:
         rows = self._load_index()
+        discovered = self._discover_metadata()
+        if discovered is not None:
+            if discovered != rows:
+                self._save_index(discovered)
+            return discovered
         reconciled: dict[str, CredentialMetadata] = {}
         changed = False
         for slug, metadata in rows.items():
@@ -459,6 +464,40 @@ class CredentialStore:
         if changed:
             self._save_index(reconciled)
         return reconciled
+
+    def _discover_metadata(self) -> dict[str, CredentialMetadata] | None:
+        """Rebuild the non-secret index from gopass without decrypting records.
+
+        The index can be absent after a home-directory/runtime migration even
+        though the encrypted Bifrost records remain valid in the password store.
+        A successful flat listing is authoritative; an unavailable backend keeps
+        the existing index usable for list/show operations.
+        """
+        result = self._run(["gopass", "ls", "--flat", "bifrost_mcp"], input_text=None, check=False)
+        if result.returncode != 0:
+            return None
+        discovered: dict[str, CredentialMetadata] = {}
+        for record_path in result.stdout.splitlines():
+            parts = record_path.strip().split("/")
+            if len(parts) != 3 or parts[0] != "bifrost_mcp" or parts[2] not in ("password", "key"):
+                continue
+            try:
+                encoded_slug = parts[1]
+                padding = "=" * (-len(encoded_slug) % 4)
+                slug = base64.b64decode(encoded_slug + padding, altchars=b"-_", validate=True).decode("utf-8")
+                parsed = parse_slug(slug)
+            except (UnicodeDecodeError, ValueError, CredentialValidationError):
+                continue
+            current = discovered.get(slug)
+            discovered[slug] = CredentialMetadata(
+                slug=slug,
+                purpose=parsed.purpose,
+                username=parsed.username,
+                canonical_host=parsed.canonical_host,
+                has_password=(parts[2] == "password") or (current.has_password if current else False),
+                has_key=(parts[2] == "key") or (current.has_key if current else False),
+            )
+        return discovered
 
     def _reconcile_metadata(self, metadata: CredentialMetadata) -> CredentialMetadata | None:
         password_exists = self._record_file_exists(metadata.slug, "password") if metadata.has_password else None
